@@ -1,0 +1,19 @@
+[package]
+name = "iris"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_4"] }
+wgpu = "22"
+tokio = { version = "1", features = ["full"] }
+rayon = "1"
+notify = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+lru = "0.12"
+futures = "0.3"
+pollster = { version = "0.4.0", features = ["macro"] }
+glib = "0.22.0"
+raw-window-handle = "0.6.2"
