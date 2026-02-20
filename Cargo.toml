@@ -17,3 +17,4 @@ futures = "0.3"
 pollster = { version = "0.4.0", features = ["macro"] }
 glib = "0.22.0"
 raw-window-handle = "0.6.2"
+gdk-pixbuf = "0.22.0"
