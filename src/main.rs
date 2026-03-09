@@ -1,12 +1,11 @@
 use adw::prelude::*;
 use gtk4::prelude::*;
-use gtk4::{EventControllerScroll, EventControllerScrollFlags, FileDialog, Orientation, glib};
+use gtk4::{FileDialog, Orientation, glib};
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 
 mod viewport;
 
@@ -15,7 +14,6 @@ const APP_ID: &str = "dev.iris.viewer";
 struct AppState {
     files: Vec<PathBuf>,
     current_index: usize,
-    scale: f64,
     rotations: HashMap<PathBuf, i32>,
     info_visible: bool,
 }
@@ -25,7 +23,6 @@ impl AppState {
         Self {
             files: vec![],
             current_index: 0,
-            scale: 1.0,
             rotations: HashMap::new(),
             info_visible: false,
         }
@@ -33,12 +30,6 @@ impl AppState {
 
     fn current_path(&self) -> Option<PathBuf> {
         self.files.get(self.current_index).cloned()
-    }
-
-    fn current_rotation(&self) -> i32 {
-        self.current_path()
-            .and_then(|p| self.rotations.get(&p).copied())
-            .unwrap_or(0)
     }
 
     fn rotate_cw(&mut self) {
@@ -188,8 +179,7 @@ fn build_ui(app: &adw::Application) {
     viewport_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     viewport_stack.set_transition_duration(150);
 
-    // ── NEW: THE ENGINE ─────────────────────────────────
-    // Wrap in Rc so we can clone it into closures
+    // ── THE ENGINE ──────────────────────────────────────
     let viewport = Rc::new(viewport::Viewport::new());
     viewport_stack.add_named(&viewport.widget, Some("image"));
     // ────────────────────────────────────────────────────
@@ -280,6 +270,8 @@ fn build_ui(app: &adw::Application) {
         .hscrollbar_policy(gtk4::PolicyType::Automatic)
         .vscrollbar_policy(gtk4::PolicyType::Never)
         .height_request(108)
+        .focusable(false)
+        .can_focus(false)
         .build();
 
     let thumb_strip = Rc::new(gtk4::Box::new(Orientation::Horizontal, 6));
@@ -336,6 +328,8 @@ fn build_ui(app: &adw::Application) {
                 let btn = gtk4::Button::builder()
                     .child(&thumb_stack)
                     .css_classes(["flat", "thumb-btn"])
+                    .focusable(false)
+                    .can_focus(false)
                     .build();
 
                 if i == current_index {
@@ -386,12 +380,13 @@ fn build_ui(app: &adw::Application) {
         let thumb_buttons = thumb_buttons.clone();
         let viewport_stack = viewport_stack.clone();
         let spinner = spinner.clone();
-        let viewport_engine = viewport.clone(); // The Engine
+        let viewport_engine = viewport.clone();
 
         move |path: PathBuf| {
-            // let rotation = state.borrow().current_rotation();
-            let idx = state.borrow().current_index;
-            let total = state.borrow().files.len();
+            let (idx, total) = {
+                let s = state.borrow();
+                (s.current_index, s.files.len())
+            };
 
             let name = path
                 .file_name()
@@ -435,7 +430,6 @@ fn build_ui(app: &adw::Application) {
             let path_async = path.clone();
 
             glib::spawn_future_local(async move {
-                // Load metadata for Info Panel
                 let bytes = load_bytes_async(path_async.clone()).await;
                 spinner_async.stop();
 
@@ -445,10 +439,8 @@ fn build_ui(app: &adw::Application) {
                     }
                 }
 
-                // Trigger Engine Load
                 viewport_engine_async.load_image(path_async);
 
-                // Switch to the WGPU Engine
                 viewport_stack_async.set_visible_child_name("image");
             });
         }
@@ -495,7 +487,7 @@ fn build_ui(app: &adw::Application) {
         info_sep_btn.set_visible(s.info_visible);
     });
 
-    // ── Rotate (Stubbed for now) ────────────────────────
+    // ── Rotate ──────────────────────────────────────────
     let state_rcw = state.clone();
     let load_rcw = load_image.clone();
     rotate_cw_btn.connect_clicked(move |_| {
@@ -526,6 +518,7 @@ fn build_ui(app: &adw::Application) {
 
     // ── Keyboard ─────────────────────────────────────────
     let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let window_key = window.clone();
     let state_key = state.clone();
     let load_key = load_image.clone();
@@ -541,13 +534,15 @@ fn build_ui(app: &adw::Application) {
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::Right | gtk4::gdk::Key::space => {
-            if let Some(p) = state_key.borrow_mut().next() {
+            let path = state_key.borrow_mut().next();
+            if let Some(p) = path {
                 load_key(p);
             }
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::Left => {
-            if let Some(p) = state_key.borrow_mut().prev() {
+            let path = state_key.borrow_mut().prev();
+            if let Some(p) = path {
                 load_key(p);
             }
             glib::Propagation::Stop

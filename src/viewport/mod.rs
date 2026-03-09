@@ -24,7 +24,6 @@ impl Viewport {
         let widget = Picture::builder()
             .hexpand(true)
             .vexpand(true)
-            .can_focus(true)
             .content_fit(gtk4::ContentFit::Fill)
             .build();
 
@@ -96,27 +95,19 @@ impl Viewport {
         }
     }
 
-    // NEW: Public API to load an image using Futures
     pub fn load_image(&self, path: PathBuf) {
-        // 1. Create a oneshot channel
         let (sender, receiver) = futures::channel::oneshot::channel();
         let r_load = self.renderer.clone();
 
-        // 2. Spawn background thread for heavy IO/Decoding
         std::thread::spawn(move || {
             let img = image::open(&path);
-            // Send the result to the future
             let _ = sender.send(img);
         });
 
-        // 3. Spawn a LOCAL future (Main Thread) to await the result
-        // Because this is 'local', we can capture 'r_load' (Rc) safely.
         glib::spawn_future_local(async move {
-            // Wait for the thread to finish
             if let Ok(load_result) = receiver.await {
                 if let Ok(image) = load_result {
                     if let Some(renderer) = r_load.borrow_mut().as_mut() {
-                        // Upload to GPU (on Main Thread)
                         renderer.load_image(&image);
                     }
                 } else {
