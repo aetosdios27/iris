@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use adw::prelude::*;
 use gtk4::prelude::*;
 use gtk4::{FileDialog, Orientation, glib};
@@ -87,7 +89,6 @@ impl AppState {
         self.current_path()
     }
 
-    /// Get paths of adjacent images for prefetching
     fn adjacent_paths(&self) -> Vec<PathBuf> {
         if self.files.is_empty() {
             return vec![];
@@ -96,11 +97,9 @@ impl AppState {
         let range = 5.min(len / 2);
         let mut paths = Vec::new();
 
-        // Forward — prioritized (user usually goes forward)
         for offset in 1..=range {
             paths.push(self.files[(self.current_index + offset) % len].clone());
         }
-        // Backward
         for offset in 1..=range {
             paths.push(self.files[(self.current_index + len - offset) % len].clone());
         }
@@ -316,7 +315,10 @@ fn build_ui(app: &adw::Application) {
             let btns = thumb_buttons.borrow();
             if let Some(btn) = btns.get(idx) {
                 let hadj = thumb_scroll.hadjustment();
-                if let Some((x, _)) = btn.translate_coordinates(&*thumb_scroll, 0.0, 0.0) {
+                if let Some(point) =
+                    btn.compute_point(&*thumb_scroll, &gtk4::graphene::Point::new(0.0, 0.0))
+                {
+                    let x = point.x() as f64;
                     let btn_width = btn.width() as f64;
                     let scroll_width = thumb_scroll.width() as f64;
                     let current = hadj.value();
@@ -398,7 +400,8 @@ fn build_ui(app: &adw::Application) {
                             if let Some(s) =
                                 pb.scale_simple(90, 90, gtk4::gdk_pixbuf::InterpType::Bilinear)
                             {
-                                thumb_pic_async.set_pixbuf(Some(&s));
+                                let texture = gtk4::gdk::Texture::for_pixbuf(&s);
+                                thumb_pic_async.set_paintable(Some(&texture));
                             }
                         }
                         thumb_stack_async.set_visible_child_name("image");
@@ -408,7 +411,7 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    // ── load_image with prefetch ─────────────────────────
+    // ── load_image ───────────────────────────────────────
     let load_image: Rc<dyn Fn(PathBuf)> = Rc::new({
         let counter_label = counter_label.clone();
         let state = state.clone();
@@ -432,7 +435,6 @@ fn build_ui(app: &adw::Application) {
                 )
             };
 
-            // Update UI immediately
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -452,7 +454,6 @@ fn build_ui(app: &adw::Application) {
                 info_size.set_label(&size_str);
             }
 
-            // Highlight thumbnail
             {
                 let btns = thumb_buttons.borrow();
                 for (i, btn) in btns.iter().enumerate() {
@@ -464,22 +465,17 @@ fn build_ui(app: &adw::Application) {
                 }
             }
 
-            // Scroll thumbnail into view
             scroll_fn();
 
-            // Apply rotation
             viewport_engine.set_rotation(rotation as f32);
 
-            // Switch to image view immediately
             viewport_stack.set_visible_child_name("image");
 
-            // Load image — instant if cached, CPU fast path if not
             let info_dims_cb = info_dims.clone();
             viewport_engine.load_image(path, move |w, h| {
                 info_dims_cb.set_label(&format!("{}×{} px", w, h));
             });
 
-            // Prefetch adjacent images in background
             for adj_path in adjacent {
                 viewport_engine.prefetch(adj_path);
             }
@@ -527,33 +523,27 @@ fn build_ui(app: &adw::Application) {
         info_sep_btn.set_visible(s.info_visible);
     });
 
-    // ── Rotate ──────────────────────────────────────────
+    // ── Rotate (instant — uniform only) ─────────────────
     let state_rcw = state.clone();
-    let load_rcw = load_image.clone();
+    let viewport_rcw = viewport.clone();
     rotate_cw_btn.connect_clicked(move |_| {
-        let path = {
+        let rotation = {
             let mut s = state_rcw.borrow_mut();
             s.rotate_cw();
-            if s.files.is_empty() {
-                return;
-            }
-            s.files[s.current_index].clone()
+            s.current_rotation()
         };
-        load_rcw(path);
+        viewport_rcw.set_rotation(rotation as f32);
     });
 
     let state_rccw = state.clone();
-    let load_rccw = load_image.clone();
+    let viewport_rccw = viewport.clone();
     rotate_ccw_btn.connect_clicked(move |_| {
-        let path = {
+        let rotation = {
             let mut s = state_rccw.borrow_mut();
             s.rotate_ccw();
-            if s.files.is_empty() {
-                return;
-            }
-            s.files[s.current_index].clone()
+            s.current_rotation()
         };
-        load_rccw(path);
+        viewport_rccw.set_rotation(rotation as f32);
     });
 
     // ── Keyboard ─────────────────────────────────────────
@@ -564,6 +554,7 @@ fn build_ui(app: &adw::Application) {
     let load_key = load_image.clone();
     let info_panel_key = info_panel.clone();
     let info_sep_key = info_sep.clone();
+    let viewport_key = viewport.clone();
     key_ctrl.connect_key_pressed(move |_, key, _, modifier| match key {
         gtk4::gdk::Key::f | gtk4::gdk::Key::F => {
             window_key.fullscreen();
@@ -588,19 +579,28 @@ fn build_ui(app: &adw::Application) {
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::r | gtk4::gdk::Key::R => {
-            let path = {
+            let rotation = {
                 let mut s = state_key.borrow_mut();
                 if modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK) {
                     s.rotate_ccw();
                 } else {
                     s.rotate_cw();
                 }
-                if s.files.is_empty() {
-                    return glib::Propagation::Stop;
-                }
-                s.files[s.current_index].clone()
+                s.current_rotation()
             };
-            load_key(path);
+            viewport_key.set_rotation(rotation as f32);
+            glib::Propagation::Stop
+        }
+        gtk4::gdk::Key::plus | gtk4::gdk::Key::equal => {
+            viewport_key.zoom_in();
+            glib::Propagation::Stop
+        }
+        gtk4::gdk::Key::minus => {
+            viewport_key.zoom_out();
+            glib::Propagation::Stop
+        }
+        gtk4::gdk::Key::_0 | gtk4::gdk::Key::Home => {
+            viewport_key.reset_view();
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::i | gtk4::gdk::Key::I => {
