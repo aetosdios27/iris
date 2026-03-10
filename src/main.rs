@@ -32,6 +32,12 @@ impl AppState {
         self.files.get(self.current_index).cloned()
     }
 
+    fn current_rotation(&self) -> i32 {
+        self.current_path()
+            .and_then(|p| self.rotations.get(&p).copied())
+            .unwrap_or(0)
+    }
+
     fn rotate_cw(&mut self) {
         if let Some(path) = self.current_path() {
             let r = self.rotations.entry(path).or_insert(0);
@@ -80,9 +86,29 @@ impl AppState {
         self.current_index = (self.current_index + self.files.len() - 1) % self.files.len();
         self.current_path()
     }
+
+    /// Get paths of adjacent images for prefetching
+    fn adjacent_paths(&self) -> Vec<PathBuf> {
+        if self.files.is_empty() {
+            return vec![];
+        }
+        let len = self.files.len();
+        let range = 5.min(len / 2);
+        let mut paths = Vec::new();
+
+        // Forward — prioritized (user usually goes forward)
+        for offset in 1..=range {
+            paths.push(self.files[(self.current_index + offset) % len].clone());
+        }
+        // Backward
+        for offset in 1..=range {
+            paths.push(self.files[(self.current_index + len - offset) % len].clone());
+        }
+
+        paths
+    }
 }
 
-// Helper for thumbnails (CPU side)
 async fn load_bytes_async(path: PathBuf) -> Option<Vec<u8>> {
     let (tx, rx) = futures::channel::oneshot::channel();
     rayon::spawn(move || {
@@ -91,7 +117,6 @@ async fn load_bytes_async(path: PathBuf) -> Option<Vec<u8>> {
     rx.await.ok().flatten()
 }
 
-// Helper for thumbnails (CPU side)
 fn pixbuf_from_bytes(bytes: &[u8], rotation: i32) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
     use gtk4::gdk_pixbuf::{PixbufLoader, PixbufRotation};
     let loader = PixbufLoader::new();
@@ -121,9 +146,9 @@ fn build_ui(app: &adw::Application) {
         .default_height(800)
         .build();
 
-    // ── CSS ─────────────────────────────────────────────
     let css = gtk4::CssProvider::new();
-    css.load_from_string("
+    css.load_from_string(
+        "
         .thumb-btn { padding: 3px; border-radius: 8px; transition: all 180ms ease; opacity: 0.6; }
         .thumb-btn:hover { opacity: 1.0; background: alpha(@accent_color, 0.15); }
         .thumb-active { opacity: 1.0; outline: 2px solid @accent_color; border-radius: 8px; background: alpha(@accent_color, 0.12); }
@@ -131,7 +156,8 @@ fn build_ui(app: &adw::Application) {
         .info-panel { padding: 16px; border-left: 1px solid alpha(@borders, 0.5); }
         .info-field-label { font-size: 11px; opacity: 0.5; margin-top: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
         .info-field-value { font-weight: 600; }
-    ");
+    ",
+    );
     gtk4::style_context_add_provider_for_display(
         &gtk4::gdk::Display::default().unwrap(),
         &css,
@@ -179,20 +205,8 @@ fn build_ui(app: &adw::Application) {
     viewport_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     viewport_stack.set_transition_duration(150);
 
-    // ── THE ENGINE ──────────────────────────────────────
     let viewport = Rc::new(viewport::Viewport::new());
     viewport_stack.add_named(&viewport.widget, Some("image"));
-    // ────────────────────────────────────────────────────
-
-    // Spinner page
-    let spinner_box = gtk4::Box::new(Orientation::Vertical, 0);
-    spinner_box.set_vexpand(true);
-    spinner_box.set_hexpand(true);
-    spinner_box.set_halign(gtk4::Align::Center);
-    spinner_box.set_valign(gtk4::Align::Center);
-    let spinner = Rc::new(gtk4::Spinner::new());
-    spinner.set_size_request(32, 32);
-    spinner_box.append(&*spinner);
 
     // Welcome page
     let welcome_box = gtk4::Box::new(Orientation::Vertical, 12);
@@ -209,7 +223,6 @@ fn build_ui(app: &adw::Application) {
     welcome_box.append(&welcome_icon);
     welcome_box.append(&welcome_lbl);
 
-    viewport_stack.add_named(&spinner_box, Some("spinner"));
     viewport_stack.add_named(&welcome_box, Some("welcome"));
     viewport_stack.set_visible_child_name("welcome");
 
@@ -266,13 +279,15 @@ fn build_ui(app: &adw::Application) {
     info_panel.append(&row_path);
 
     // ── Thumbnail Strip ──────────────────────────────────
-    let thumb_scroll = gtk4::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk4::PolicyType::Automatic)
-        .vscrollbar_policy(gtk4::PolicyType::Never)
-        .height_request(108)
-        .focusable(false)
-        .can_focus(false)
-        .build();
+    let thumb_scroll = Rc::new(
+        gtk4::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk4::PolicyType::Automatic)
+            .vscrollbar_policy(gtk4::PolicyType::Never)
+            .height_request(108)
+            .focusable(false)
+            .can_focus(false)
+            .build(),
+    );
 
     let thumb_strip = Rc::new(gtk4::Box::new(Orientation::Horizontal, 6));
     thumb_strip.set_margin_start(8);
@@ -283,13 +298,37 @@ fn build_ui(app: &adw::Application) {
 
     root_box.append(&content_box);
     root_box.append(&gtk4::Separator::new(Orientation::Horizontal));
-    root_box.append(&thumb_scroll);
+    root_box.append(&*thumb_scroll);
 
     toolbar_view.set_content(Some(&root_box));
     window.set_content(Some(&toolbar_view));
 
     let thumb_buttons: Rc<RefCell<Vec<gtk4::Button>>> = Rc::new(RefCell::new(vec![]));
     let load_image_fn: Rc<RefCell<Option<Rc<dyn Fn(PathBuf)>>>> = Rc::new(RefCell::new(None));
+
+    // ── scroll_to_active_thumb ───────────────────────────
+    let scroll_to_active_thumb = {
+        let thumb_buttons = thumb_buttons.clone();
+        let thumb_scroll = thumb_scroll.clone();
+        let state = state.clone();
+        Rc::new(move || {
+            let idx = state.borrow().current_index;
+            let btns = thumb_buttons.borrow();
+            if let Some(btn) = btns.get(idx) {
+                let hadj = thumb_scroll.hadjustment();
+                if let Some((x, _)) = btn.translate_coordinates(&*thumb_scroll, 0.0, 0.0) {
+                    let btn_width = btn.width() as f64;
+                    let scroll_width = thumb_scroll.width() as f64;
+                    let current = hadj.value();
+
+                    if x < 0.0 || x + btn_width > scroll_width {
+                        let target = current + x - (scroll_width / 2.0) + (btn_width / 2.0);
+                        hadj.set_value(target.max(0.0));
+                    }
+                }
+            }
+        })
+    };
 
     // ── populate_thumbnails ──────────────────────────────
     let populate_thumbnails: Rc<dyn Fn()> = Rc::new({
@@ -369,7 +408,7 @@ fn build_ui(app: &adw::Application) {
         }
     });
 
-    // ── load_image ───────────────────────────────────────
+    // ── load_image with prefetch ─────────────────────────
     let load_image: Rc<dyn Fn(PathBuf)> = Rc::new({
         let counter_label = counter_label.clone();
         let state = state.clone();
@@ -379,15 +418,21 @@ fn build_ui(app: &adw::Application) {
         let info_path_lbl = info_path_lbl.clone();
         let thumb_buttons = thumb_buttons.clone();
         let viewport_stack = viewport_stack.clone();
-        let spinner = spinner.clone();
         let viewport_engine = viewport.clone();
+        let scroll_fn = scroll_to_active_thumb.clone();
 
         move |path: PathBuf| {
-            let (idx, total) = {
+            let (idx, total, rotation, adjacent) = {
                 let s = state.borrow();
-                (s.current_index, s.files.len())
+                (
+                    s.current_index,
+                    s.files.len(),
+                    s.current_rotation(),
+                    s.adjacent_paths(),
+                )
             };
 
+            // Update UI immediately
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -419,30 +464,25 @@ fn build_ui(app: &adw::Application) {
                 }
             }
 
-            // Show Spinner
-            spinner.start();
-            viewport_stack.set_visible_child_name("spinner");
+            // Scroll thumbnail into view
+            scroll_fn();
 
-            let info_dims_async = info_dims.clone();
-            let viewport_stack_async = viewport_stack.clone();
-            let spinner_async = spinner.clone();
-            let viewport_engine_async = viewport_engine.clone();
-            let path_async = path.clone();
+            // Apply rotation
+            viewport_engine.set_rotation(rotation as f32);
 
-            glib::spawn_future_local(async move {
-                let bytes = load_bytes_async(path_async.clone()).await;
-                spinner_async.stop();
+            // Switch to image view immediately
+            viewport_stack.set_visible_child_name("image");
 
-                if let Some(b) = bytes {
-                    if let Some(pb) = pixbuf_from_bytes(&b, 0) {
-                        info_dims_async.set_label(&format!("{}×{} px", pb.width(), pb.height()));
-                    }
-                }
-
-                viewport_engine_async.load_image(path_async);
-
-                viewport_stack_async.set_visible_child_name("image");
+            // Load image — instant if cached, CPU fast path if not
+            let info_dims_cb = info_dims.clone();
+            viewport_engine.load_image(path, move |w, h| {
+                info_dims_cb.set_label(&format!("{}×{} px", w, h));
             });
+
+            // Prefetch adjacent images in background
+            for adj_path in adjacent {
+                viewport_engine.prefetch(adj_path);
+            }
         }
     });
 

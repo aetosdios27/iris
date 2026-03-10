@@ -1,10 +1,12 @@
 struct Uniforms {
-    view_proj: mat4x4<f32>,
-    // New: Scale factor for the image (width, height)
-    image_scale: vec2<f32>,
+    scale: vec2<f32>,
+    rotation: f32,
+    zoom: f32,
+    pan: vec2<f32>,
+    _padding: vec2<f32>,
 }
 
-@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var t_diffuse: texture_2d<f32>;
 @group(0) @binding(2) var s_diffuse: sampler;
 
@@ -13,40 +15,55 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 }
 
+fn rotate2d(angle: f32) -> mat2x2<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return mat2x2<f32>(
+        vec2<f32>(c, -s),
+        vec2<f32>(s, c)
+    );
+}
+
 @vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    // A proper Quad (Rectangle) centered at 0,0
-    // 2 Triangles, 6 Vertices total
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    // Fullscreen quad: 2 triangles, 6 vertices
+    // Positions in NDC (-1 to 1)
     var pos = array<vec2<f32>, 6>(
-        vec2<f32>(-0.5,  0.5), // Top-Left
-        vec2<f32>(-0.5, -0.5), // Bottom-Left
-        vec2<f32>( 0.5,  0.5), // Top-Right
-        vec2<f32>( 0.5,  0.5), // Top-Right
-        vec2<f32>(-0.5, -0.5), // Bottom-Left
-        vec2<f32>( 0.5, -0.5)  // Bottom-Right
+        vec2<f32>(-1.0,  1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0, -1.0)
     );
 
-    // UV Coordinates (0,0 is Top-Left in WGPU)
     var uvs = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 0.0), // TL
-        vec2<f32>(0.0, 1.0), // BL
-        vec2<f32>(1.0, 0.0), // TR
-        vec2<f32>(1.0, 0.0), // TR
-        vec2<f32>(0.0, 1.0), // BL
-        vec2<f32>(1.0, 1.0)  // BR
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 1.0)
     );
 
     var out: VertexOutput;
 
-    // 1. Get base position
-    let raw_pos = pos[in_vertex_index];
+    var p = pos[idx];
 
-    // 2. Scale it by the image dimensions (aspect ratio correction)
-    let scaled_pos = raw_pos * uniforms.image_scale;
+    // 1. Apply aspect-ratio-correct scale (fit image in viewport)
+    p = p * u.scale;
 
-    // 3. Apply Camera View/Projection
-    out.position = uniforms.view_proj * vec4<f32>(scaled_pos, 0.0, 1.0);
-    out.uv = uvs[in_vertex_index];
+    // 2. Apply rotation around center
+    p = rotate2d(u.rotation) * p;
+
+    // 3. Apply zoom
+    p = p * u.zoom;
+
+    // 4. Apply pan
+    p = p + u.pan;
+
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = uvs[idx];
 
     return out;
 }

@@ -2,6 +2,8 @@ use super::camera::Camera;
 use super::gpu::GpuContext;
 use bytemuck::{Pod, Zeroable};
 use image::GenericImageView;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use wgpu::*;
@@ -9,11 +11,17 @@ use wgpu::*;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 struct Uniforms {
-    view_proj: [[f32; 4]; 4],
-    // New: Width/Height of the image in world space
-    image_scale: [f32; 2],
-    // Padding to keep struct 16-byte aligned (WGPU requirement)
-    padding: [f32; 2],
+    scale: [f32; 2],
+    rotation: f32,
+    zoom: f32,
+    pan: [f32; 2],
+    _padding: [f32; 2],
+}
+
+struct CachedImage {
+    dims: (f32, f32),
+    texture: Texture,
+    memory_bytes: u64,
 }
 
 pub struct IrisRenderer {
@@ -30,8 +38,13 @@ pub struct IrisRenderer {
     pub height: u32,
     pub padded_bytes_per_row: u32,
 
-    // Current image dimensions
     pub image_dims: (f32, f32),
+    pub dirty: bool,
+
+    cache: HashMap<PathBuf, CachedImage>,
+    cache_order: Vec<PathBuf>,
+    cache_memory_used: u64,
+    cache_memory_budget: u64,
 }
 
 impl IrisRenderer {
@@ -41,7 +54,6 @@ impl IrisRenderer {
             source: ShaderSource::Wgsl(include_str!("./shaders/image.wgsl").into()),
         });
 
-        // 1. Uniforms
         let uniform_buffer = gpu.device.create_buffer(&BufferDescriptor {
             label: Some("Uniform Buffer"),
             size: std::mem::size_of::<Uniforms>() as u64,
@@ -49,7 +61,6 @@ impl IrisRenderer {
             mapped_at_creation: false,
         });
 
-        // 2. Sampler
         let sampler = gpu.device.create_sampler(&SamplerDescriptor {
             address_mode_u: AddressMode::ClampToEdge,
             address_mode_v: AddressMode::ClampToEdge,
@@ -58,7 +69,6 @@ impl IrisRenderer {
             ..Default::default()
         });
 
-        // 3. Layout
         let bind_group_layout = gpu
             .device
             .create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -66,7 +76,7 @@ impl IrisRenderer {
                 entries: &[
                     BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: ShaderStages::VERTEX,
+                        visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -93,7 +103,6 @@ impl IrisRenderer {
                 ],
             });
 
-        // 4. Default Texture
         let default_tex = gpu.device.create_texture_with_data(
             &gpu.queue,
             &TextureDescriptor {
@@ -111,7 +120,7 @@ impl IrisRenderer {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::MipMajor,
-            &[255, 255, 255, 255],
+            &[0, 0, 0, 255],
         );
         let default_view = default_tex.create_view(&TextureViewDescriptor::default());
 
@@ -134,7 +143,6 @@ impl IrisRenderer {
             ],
         });
 
-        // 5. Pipeline
         let pipeline_layout = gpu
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -172,6 +180,7 @@ impl IrisRenderer {
             });
 
         let (output_texture, output_buffer, padded) = Self::create_targets(&gpu, width, height);
+        let cache_memory_budget = gpu.cache_budget;
 
         Self {
             gpu,
@@ -186,24 +195,94 @@ impl IrisRenderer {
             height,
             padded_bytes_per_row: padded,
             image_dims: (1.0, 1.0),
+            dirty: true,
+            cache: HashMap::new(),
+            cache_order: Vec::new(),
+            cache_memory_used: 0,
+            cache_memory_budget,
         }
     }
 
-    pub fn load_image(&mut self, img: &image::DynamicImage) {
-        let rgba = img.to_rgba8();
-        let (w, h) = img.dimensions();
+    /// Downscale if exceeds GPU limits
+    fn fit_to_gpu_limits(&self, rgba: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+        let max = self.gpu.max_texture_size;
 
-        // Save dimensions to fix aspect ratio
-        self.image_dims = (w as f32, h as f32);
+        if w <= max && h <= max {
+            return (rgba.to_vec(), w, h);
+        }
+
+        let scale = (max as f32 / w as f32).min(max as f32 / h as f32);
+        let new_w = ((w as f32 * scale) as u32).max(1);
+        let new_h = ((h as f32 * scale) as u32).max(1);
+
+        println!(
+            "[resize] {}×{} exceeds GPU limit {}px, downscaling to {}×{}",
+            w, h, max, new_w, new_h
+        );
+
+        let img_buf =
+            image::RgbaImage::from_raw(w, h, rgba.to_vec()).expect("Failed to create image buffer");
+        let resized = image::imageops::resize(
+            &img_buf,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Lanczos3,
+        );
+
+        (resized.into_raw(), new_w, new_h)
+    }
+
+    /// Activate a cached image for display. Returns dims if found.
+    pub fn activate_cached(&mut self, path: &Path) -> Option<(f32, f32)> {
+        if let Some(cached) = self.cache.get(path) {
+            self.image_dims = cached.dims;
+
+            let view = cached
+                .texture
+                .create_view(&TextureViewDescriptor::default());
+            self.bind_group = self.gpu.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("Cached Bind Group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniform_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.dirty = true;
+
+            self.cache_order.retain(|p| p != path);
+            self.cache_order.insert(0, path.to_owned());
+
+            Some(cached.dims)
+        } else {
+            None
+        }
+    }
+
+    /// Cache-only: upload texture to GPU cache, do NOT change bind_group or image_dims.
+    /// Used by prefetch so it never affects current display.
+    pub fn cache_only(&mut self, path: &Path, rgba: &[u8], w: u32, h: u32) {
+        let (final_rgba, final_w, final_h) = self.fit_to_gpu_limits(rgba, w, h);
+        let mem = (final_w as u64) * (final_h as u64) * 4;
 
         let texture_size = Extent3d {
-            width: w,
-            height: h,
+            width: final_w,
+            height: final_h,
             depth_or_array_layers: 1,
         };
 
         let texture = self.gpu.device.create_texture(&TextureDescriptor {
-            label: Some("Image Texture"),
+            label: Some("Cached Texture"),
             size: texture_size,
             mip_level_count: 1,
             sample_count: 1,
@@ -220,35 +299,66 @@ impl IrisRenderer {
                 origin: Origin3d::ZERO,
                 aspect: TextureAspect::All,
             },
-            &rgba,
+            &final_rgba,
             ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * w),
-                rows_per_image: Some(h),
+                bytes_per_row: Some(4 * final_w),
+                rows_per_image: Some(final_h),
             },
             texture_size,
         );
 
-        let view = texture.create_view(&TextureViewDescriptor::default());
+        // Cache management — evict if needed
+        let path_buf = path.to_owned();
+        if let Some(old) = self.cache.remove(&path_buf) {
+            self.cache_memory_used = self.cache_memory_used.saturating_sub(old.memory_bytes);
+            self.cache_order.retain(|p| p != &path_buf);
+        }
 
-        self.bind_group = self.gpu.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Image Bind Group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        while self.cache_memory_used + mem > self.cache_memory_budget
+            && !self.cache_order.is_empty()
+        {
+            if let Some(oldest) = self.cache_order.pop() {
+                if let Some(evicted) = self.cache.remove(&oldest) {
+                    self.cache_memory_used =
+                        self.cache_memory_used.saturating_sub(evicted.memory_bytes);
+                }
+            }
+        }
+
+        self.cache_order.insert(0, path_buf.clone());
+        self.cache_memory_used += mem;
+        self.cache.insert(
+            path_buf,
+            CachedImage {
+                dims: (w as f32, h as f32), // Original dims
+                texture,
+                memory_bytes: mem,
+            },
+        );
+
+        // NOTE: bind_group, image_dims, dirty are NOT modified
+    }
+
+    /// Upload, cache, AND activate for display.
+    /// Used when loading the current image (not prefetch).
+    pub fn upload_and_activate(&mut self, path: &Path, rgba: &[u8], w: u32, h: u32) {
+        // First cache it
+        self.cache_only(path, rgba, w, h);
+        // Then activate it (sets bind_group, image_dims, dirty)
+        self.activate_cached(path);
+    }
+
+    pub fn is_cached(&self, path: &Path) -> bool {
+        self.cache.contains_key(path)
+    }
+
+    pub fn cache_stats(&self) -> (usize, u64, u64) {
+        (
+            self.cache.len(),
+            self.cache_memory_used,
+            self.cache_memory_budget,
+        )
     }
 
     fn create_targets(gpu: &GpuContext, width: u32, height: u32) -> (Texture, Buffer, u32) {
@@ -291,27 +401,19 @@ impl IrisRenderer {
             self.output_texture = tex;
             self.output_buffer = buf;
             self.padded_bytes_per_row = padded;
+            self.dirty = true;
         }
     }
 
     pub fn render(&mut self, camera: &Camera) {
-        // Calculate Aspect Ratio Correction
-        // We want the image to maintain its native ratio
-        // We normalize it so the longest side is 1.0 (or keep it native size, but let's do 1:1 units first)
-
-        let aspect = self.image_dims.0 / self.image_dims.1;
-
-        // This makes the quad match the image shape
-        let scale = if aspect > 1.0 {
-            [1.0, 1.0 / aspect] // Wide image
-        } else {
-            [aspect, 1.0] // Tall image
-        };
+        let scale = camera.fit_scale(self.image_dims.0, self.image_dims.1);
 
         let uniforms = Uniforms {
-            view_proj: camera.build_view_projection_matrix().to_cols_array_2d(),
-            image_scale: scale,
-            padding: [0.0; 2],
+            scale,
+            rotation: camera.rotation,
+            zoom: camera.zoom,
+            pan: [camera.position.x, camera.position.y],
+            _padding: [0.0; 2],
         };
 
         self.gpu
@@ -350,7 +452,6 @@ impl IrisRenderer {
             });
             rpass.set_pipeline(&self.pipeline);
             rpass.set_bind_group(0, &self.bind_group, &[]);
-            // FIX: Draw 6 vertices for the Quad (not 3)
             rpass.draw(0..6, 0..1);
         }
 
@@ -377,5 +478,6 @@ impl IrisRenderer {
         );
 
         self.gpu.queue.submit(Some(encoder.finish()));
+        self.dirty = false;
     }
 }
