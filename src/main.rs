@@ -6,18 +6,62 @@ use gtk4::{FileDialog, Orientation, glib};
 use libadwaita as adw;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+mod color;
+mod config;
+mod error;
+mod raw;
+mod thumbcache;
 mod viewport;
 
+use config::Config;
+
 const APP_ID: &str = "dev.iris.viewer";
+
+// ── EXIF orientation reader ──────────────────────────────────────────────────
+
+fn read_exif_rotation(path: &Path) -> i32 {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let mut buf = std::io::BufReader::new(file);
+    let exif = match exif::Reader::new().read_from_container(&mut buf) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    match exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
+        Some(field) => match field.value.get_uint(0) {
+            Some(1) => 0,
+            Some(3) => 180,
+            Some(6) => 90,
+            Some(8) => 270,
+            _ => 0,
+        },
+        None => 0,
+    }
+}
+
+// ── Per-image view state ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct ViewState {
+    zoom: f32,
+    position_x: f32,
+    position_y: f32,
+}
+
+// ── AppState ─────────────────────────────────────────────────────────────────
 
 struct AppState {
     files: Vec<PathBuf>,
     current_index: usize,
     rotations: HashMap<PathBuf, i32>,
+    view_states: HashMap<PathBuf, ViewState>,
     info_visible: bool,
+    watched_directory: Option<PathBuf>,
 }
 
 impl AppState {
@@ -26,7 +70,9 @@ impl AppState {
             files: vec![],
             current_index: 0,
             rotations: HashMap::new(),
+            view_states: HashMap::new(),
             info_visible: false,
+            watched_directory: None,
         }
     }
 
@@ -56,21 +102,66 @@ impl AppState {
 
     fn load_directory(&mut self, path: &PathBuf) {
         if let Some(parent) = path.parent() {
-            let mut files: Vec<PathBuf> = std::fs::read_dir(parent)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| {
-                    matches!(
-                        p.extension().and_then(|e| e.to_str()),
-                        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "tiff" | "bmp")
-                    )
-                })
-                .collect();
+            let mut files = Self::scan_images(parent);
             files.sort();
             self.current_index = files.iter().position(|f| f == path).unwrap_or(0);
             self.files = files;
+            self.watched_directory = Some(parent.to_path_buf());
         }
+    }
+
+    fn load_from_directory(&mut self, dir: &Path) {
+        let mut files = Self::scan_images(dir);
+        files.sort();
+        self.current_index = 0;
+        self.files = files;
+        self.watched_directory = Some(dir.to_path_buf());
+    }
+
+    fn refresh_watched_directory(&mut self) -> Option<PathBuf> {
+        let dir = self.watched_directory.clone()?;
+        let old_current = self.current_path();
+        let mut files = Self::scan_images(&dir);
+        files.sort();
+
+        if files.is_empty() {
+            self.files.clear();
+            self.current_index = 0;
+            return None;
+        }
+
+        let new_current = if let Some(old) = old_current {
+            if let Some(idx) = files.iter().position(|f| *f == old) {
+                self.current_index = idx;
+                old
+            } else {
+                self.current_index = self.current_index.min(files.len() - 1);
+                files[self.current_index].clone()
+            }
+        } else {
+            self.current_index = self.current_index.min(files.len() - 1);
+            files[self.current_index].clone()
+        };
+
+        self.files = files;
+        Some(new_current)
+    }
+
+    fn scan_images(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return vec![];
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                let is_standard = matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "tiff" | "bmp")
+                );
+                is_standard || crate::raw::is_raw(p)
+            })
+            .collect()
     }
 
     fn next(&mut self) -> Option<PathBuf> {
@@ -96,17 +187,17 @@ impl AppState {
         let len = self.files.len();
         let range = 5.min(len / 2);
         let mut paths = Vec::new();
-
         for offset in 1..=range {
             paths.push(self.files[(self.current_index + offset) % len].clone());
         }
         for offset in 1..=range {
             paths.push(self.files[(self.current_index + len - offset) % len].clone());
         }
-
         paths
     }
 }
+
+// ── Async helpers ────────────────────────────────────────────────────────────
 
 async fn load_bytes_async(path: PathBuf) -> Option<Vec<u8>> {
     let (tx, rx) = futures::channel::oneshot::channel();
@@ -131,19 +222,90 @@ fn pixbuf_from_bytes(bytes: &[u8], rotation: i32) -> Option<gtk4::gdk_pixbuf::Pi
     pixbuf.rotate_simple(rot)
 }
 
+// ── Directory watcher ────────────────────────────────────────────────────────
+
+fn start_directory_watcher(
+    state: Rc<RefCell<AppState>>,
+    populate_thumbnails: Rc<dyn Fn()>,
+    load_image: Rc<dyn Fn(PathBuf)>,
+) -> notify::RecommendedWatcher {
+    use notify::{RecursiveMode, Watcher};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+
+    let mut watcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .expect("Failed to create directory watcher");
+
+    if let Some(dir) = state.borrow().watched_directory.clone() {
+        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+    }
+
+    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let mut changed = false;
+        while let Ok(res) = rx.try_recv() {
+            match res {
+                Ok(_event) => changed = true,
+                Err(err) => eprintln!("[Iris] Directory watch error: {err}"),
+            }
+        }
+
+        if changed {
+            let next = state.borrow_mut().refresh_watched_directory();
+            populate_thumbnails();
+            if let Some(path) = next {
+                load_image(path);
+            }
+        }
+
+        glib::ControlFlow::Continue
+    });
+
+    watcher
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
 fn main() {
-    let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gtk4::gio::ApplicationFlags::HANDLES_OPEN)
+        .build();
+
+    app.connect_activate(|app| {
+        build_ui(app, None);
+    });
+
+    app.connect_open(|app, files, _hint| {
+        let path = files.first().and_then(|f| f.path());
+        build_ui(app, path);
+    });
+
     app.run();
 }
 
-fn build_ui(app: &adw::Application) {
+// ── UI ───────────────────────────────────────────────────────────────────────
+
+fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
+
+    let cfg = Config::load();
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Iris")
-        .default_width(1200)
-        .default_height(800)
+        .default_width(cfg.window_width)
+        .default_height(cfg.window_height)
         .build();
+
+    if cfg.window_maximized {
+        window.maximize();
+    }
 
     let css = gtk4::CssProvider::new();
     css.load_from_string(
@@ -164,6 +326,7 @@ fn build_ui(app: &adw::Application) {
     );
 
     let state = Rc::new(RefCell::new(AppState::new()));
+    state.borrow_mut().info_visible = cfg.info_panel_visible;
 
     // ── Header ──────────────────────────────────────────
     let toolbar_view = adw::ToolbarView::new();
@@ -183,10 +346,27 @@ fn build_ui(app: &adw::Application) {
         .tooltip_text("Image info (I)")
         .build();
 
+    let enhance_btn = gtk4::ToggleButton::builder()
+        .icon_name("display-brightness-symbolic")
+        .tooltip_text("Auto Enhance (E)")
+        .build();
+    let sharpen_btn = gtk4::ToggleButton::builder()
+        .icon_name("find-location-symbolic")
+        .tooltip_text("Sharpen (S)")
+        .build();
+    let denoise_btn = gtk4::ToggleButton::builder()
+        .icon_name("weather-fog-symbolic")
+        .tooltip_text("Denoise (D)")
+        .build();
+
     header.pack_start(&open_btn);
     header.pack_end(&info_btn);
     header.pack_end(&rotate_cw_btn);
     header.pack_end(&rotate_ccw_btn);
+    header.pack_end(&gtk4::Separator::new(Orientation::Vertical));
+    header.pack_end(&denoise_btn);
+    header.pack_end(&sharpen_btn);
+    header.pack_end(&enhance_btn);
 
     let counter_label = Rc::new(gtk4::Label::new(Some("Iris")));
     header.set_title_widget(Some(&*counter_label));
@@ -197,17 +377,24 @@ fn build_ui(app: &adw::Application) {
     let content_box = gtk4::Box::new(Orientation::Horizontal, 0);
     content_box.set_vexpand(true);
 
-    // ── Viewport stack ───────────────────────────────────
+    let toast_overlay = adw::ToastOverlay::new();
+
     let viewport_stack = Rc::new(gtk4::Stack::new());
     viewport_stack.set_vexpand(true);
     viewport_stack.set_hexpand(true);
     viewport_stack.set_transition_type(gtk4::StackTransitionType::Crossfade);
     viewport_stack.set_transition_duration(150);
 
-    let viewport = Rc::new(viewport::Viewport::new());
+    let viewport = Rc::new(viewport::Viewport::new({
+        let toast_overlay = toast_overlay.clone();
+        move |msg| {
+            let toast = adw::Toast::new(&msg);
+            toast.set_timeout(5);
+            toast_overlay.add_toast(toast);
+        }
+    }));
     viewport_stack.add_named(&viewport.widget, Some("image"));
 
-    // Welcome page
     let welcome_box = gtk4::Box::new(Orientation::Vertical, 12);
     welcome_box.set_halign(gtk4::Align::Center);
     welcome_box.set_valign(gtk4::Align::Center);
@@ -215,7 +402,7 @@ fn build_ui(app: &adw::Application) {
     welcome_icon.set_pixel_size(64);
     welcome_icon.set_opacity(0.3);
     let welcome_lbl = gtk4::Label::builder()
-        .label("Open an image to begin")
+        .label("Open an image or drag one here")
         .css_classes(["title-4"])
         .opacity(0.4)
         .build();
@@ -227,14 +414,13 @@ fn build_ui(app: &adw::Application) {
 
     content_box.append(&*viewport_stack);
 
-    // ── Info Panel ──────────────────────────────────────
     let info_sep = Rc::new(gtk4::Separator::new(Orientation::Vertical));
-    info_sep.set_visible(false);
+    info_sep.set_visible(cfg.info_panel_visible);
     content_box.append(&*info_sep);
 
     let info_panel = Rc::new(gtk4::Box::new(Orientation::Vertical, 4));
     info_panel.set_width_request(260);
-    info_panel.set_visible(false);
+    info_panel.set_visible(cfg.info_panel_visible);
     info_panel.add_css_class("info-panel");
     content_box.append(&*info_panel);
 
@@ -277,7 +463,6 @@ fn build_ui(app: &adw::Application) {
     info_panel.append(&row_size);
     info_panel.append(&row_path);
 
-    // ── Thumbnail Strip ──────────────────────────────────
     let thumb_scroll = Rc::new(
         gtk4::ScrolledWindow::builder()
             .hscrollbar_policy(gtk4::PolicyType::Automatic)
@@ -300,12 +485,12 @@ fn build_ui(app: &adw::Application) {
     root_box.append(&*thumb_scroll);
 
     toolbar_view.set_content(Some(&root_box));
-    window.set_content(Some(&toolbar_view));
+    toast_overlay.set_child(Some(&toolbar_view));
+    window.set_content(Some(&toast_overlay));
 
     let thumb_buttons: Rc<RefCell<Vec<gtk4::Button>>> = Rc::new(RefCell::new(vec![]));
     let load_image_fn: Rc<RefCell<Option<Rc<dyn Fn(PathBuf)>>>> = Rc::new(RefCell::new(None));
 
-    // ── scroll_to_active_thumb ───────────────────────────
     let scroll_to_active_thumb = {
         let thumb_buttons = thumb_buttons.clone();
         let thumb_scroll = thumb_scroll.clone();
@@ -322,7 +507,6 @@ fn build_ui(app: &adw::Application) {
                     let btn_width = btn.width() as f64;
                     let scroll_width = thumb_scroll.width() as f64;
                     let current = hadj.value();
-
                     if x < 0.0 || x + btn_width > scroll_width {
                         let target = current + x - (scroll_width / 2.0) + (btn_width / 2.0);
                         hadj.set_value(target.max(0.0));
@@ -332,17 +516,18 @@ fn build_ui(app: &adw::Application) {
         })
     };
 
-    // ── populate_thumbnails ──────────────────────────────
     let populate_thumbnails: Rc<dyn Fn()> = Rc::new({
         let thumb_strip = thumb_strip.clone();
         let thumb_buttons = thumb_buttons.clone();
         let state = state.clone();
         let load_fn_ref = load_image_fn.clone();
+
         move || {
             while let Some(child) = thumb_strip.first_child() {
                 thumb_strip.remove(&child);
             }
             thumb_buttons.borrow_mut().clear();
+
             let files = state.borrow().files.clone();
             let current_index = state.borrow().current_index;
 
@@ -393,25 +578,32 @@ fn build_ui(app: &adw::Application) {
                 let path_async = path.clone();
                 let thumb_pic_async = thumb_pic.clone();
                 let thumb_stack_async = thumb_stack.clone();
+
                 glib::spawn_future_local(async move {
-                    let bytes = load_bytes_async(path_async).await;
-                    if let Some(b) = bytes {
-                        if let Some(pb) = pixbuf_from_bytes(&b, 0) {
-                            if let Some(s) =
-                                pb.scale_simple(90, 90, gtk4::gdk_pixbuf::InterpType::Bilinear)
-                            {
-                                let texture = gtk4::gdk::Texture::for_pixbuf(&s);
-                                thumb_pic_async.set_paintable(Some(&texture));
-                            }
-                        }
+                    if let Some(texture) = crate::thumbcache::load(&path_async) {
+                        thumb_pic_async.set_paintable(Some(&texture));
                         thumb_stack_async.set_visible_child_name("image");
+                        return;
                     }
+
+                    let (tx, rx) = futures::channel::oneshot::channel();
+                    rayon::spawn({
+                        let path = path_async.clone();
+                        move || {
+                            let thumb = crate::thumbcache::generate(&path);
+                            let _ = tx.send(thumb);
+                        }
+                    });
+
+                    if let Ok(Some(texture)) = rx.await {
+                        thumb_pic_async.set_paintable(Some(&texture));
+                    }
+                    thumb_stack_async.set_visible_child_name("image");
                 });
             }
         }
     });
 
-    // ── load_image ───────────────────────────────────────
     let load_image: Rc<dyn Fn(PathBuf)> = Rc::new({
         let counter_label = counter_label.clone();
         let state = state.clone();
@@ -425,6 +617,33 @@ fn build_ui(app: &adw::Application) {
         let scroll_fn = scroll_to_active_thumb.clone();
 
         move |path: PathBuf| {
+            {
+                let current = state.borrow().current_path();
+                if let Some(ref current_path) = current {
+                    let (zoom, px, py) = viewport_engine.get_view_state();
+                    if zoom != 1.0 || px != 0.0 || py != 0.0 {
+                        state.borrow_mut().view_states.insert(
+                            current_path.clone(),
+                            ViewState {
+                                zoom,
+                                position_x: px,
+                                position_y: py,
+                            },
+                        );
+                    }
+                }
+            }
+
+            {
+                let mut s = state.borrow_mut();
+                if !s.rotations.contains_key(&path) {
+                    let exif_rot = read_exif_rotation(&path);
+                    if exif_rot != 0 {
+                        s.rotations.insert(path.clone(), exif_rot);
+                    }
+                }
+            }
+
             let (idx, total, rotation, adjacent) = {
                 let s = state.borrow();
                 (
@@ -434,6 +653,15 @@ fn build_ui(app: &adw::Application) {
                     s.adjacent_paths(),
                 )
             };
+
+            {
+                let s = state.borrow();
+                if let Some(vs) = s.view_states.get(&path) {
+                    viewport_engine.prepare_view(vs.zoom, vs.position_x, vs.position_y);
+                } else {
+                    viewport_engine.prepare_view(1.0, 0.0, 0.0);
+                }
+            }
 
             let name = path
                 .file_name()
@@ -466,9 +694,7 @@ fn build_ui(app: &adw::Application) {
             }
 
             scroll_fn();
-
             viewport_engine.set_rotation(rotation as f32);
-
             viewport_stack.set_visible_child_name("image");
 
             let info_dims_cb = info_dims.clone();
@@ -484,7 +710,12 @@ fn build_ui(app: &adw::Application) {
 
     *load_image_fn.borrow_mut() = Some(load_image.clone());
 
-    // ── Open dialog ──────────────────────────────────────
+    let _watcher = start_directory_watcher(
+        state.clone(),
+        populate_thumbnails.clone(),
+        load_image.clone(),
+    );
+
     let window_ref = window.clone();
     let state_open = state.clone();
     let load_open = load_image.clone();
@@ -512,7 +743,6 @@ fn build_ui(app: &adw::Application) {
         );
     });
 
-    // ── Info toggle ──────────────────────────────────────
     let info_panel_btn = info_panel.clone();
     let info_sep_btn = info_sep.clone();
     let state_info = state.clone();
@@ -523,7 +753,6 @@ fn build_ui(app: &adw::Application) {
         info_sep_btn.set_visible(s.info_visible);
     });
 
-    // ── Rotate (instant — uniform only) ─────────────────
     let state_rcw = state.clone();
     let viewport_rcw = viewport.clone();
     rotate_cw_btn.connect_clicked(move |_| {
@@ -546,7 +775,57 @@ fn build_ui(app: &adw::Application) {
         viewport_rccw.set_rotation(rotation as f32);
     });
 
-    // ── Keyboard ─────────────────────────────────────────
+    let viewport_enh = viewport.clone();
+    enhance_btn.connect_toggled(move |_| {
+        viewport_enh.toggle_enhance();
+    });
+
+    let viewport_shp = viewport.clone();
+    sharpen_btn.connect_toggled(move |_| {
+        viewport_shp.toggle_sharpen();
+    });
+
+    let viewport_dns = viewport.clone();
+    denoise_btn.connect_toggled(move |_| {
+        viewport_dns.toggle_denoise();
+    });
+
+    let drop_target = gtk4::DropTarget::new(
+        gtk4::gdk::FileList::static_type(),
+        gtk4::gdk::DragAction::COPY,
+    );
+    let state_drop = state.clone();
+    let load_drop = load_image.clone();
+    let populate_drop = populate_thumbnails.clone();
+    drop_target.connect_drop(move |_, value, _, _| {
+        let Ok(file_list) = value.get::<gtk4::gdk::FileList>() else {
+            return false;
+        };
+        let files = file_list.files();
+        let Some(file) = files.first() else {
+            return false;
+        };
+        let Some(path) = file.path() else {
+            return false;
+        };
+        if path.is_file() {
+            state_drop.borrow_mut().load_directory(&path);
+            populate_drop();
+            load_drop(path);
+            true
+        } else if path.is_dir() {
+            state_drop.borrow_mut().load_from_directory(&path);
+            populate_drop();
+            if let Some(first) = state_drop.borrow().current_path() {
+                load_drop(first);
+            }
+            true
+        } else {
+            false
+        }
+    });
+    window.add_controller(drop_target);
+
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
     let window_key = window.clone();
@@ -610,9 +889,51 @@ fn build_ui(app: &adw::Application) {
             info_sep_key.set_visible(s.info_visible);
             glib::Propagation::Stop
         }
+        gtk4::gdk::Key::e | gtk4::gdk::Key::E => {
+            viewport_key.toggle_enhance();
+            glib::Propagation::Stop
+        }
+        gtk4::gdk::Key::s | gtk4::gdk::Key::S => {
+            viewport_key.toggle_sharpen();
+            glib::Propagation::Stop
+        }
+        gtk4::gdk::Key::d | gtk4::gdk::Key::D => {
+            viewport_key.toggle_denoise();
+            glib::Propagation::Stop
+        }
         _ => glib::Propagation::Proceed,
     });
     window.add_controller(key_ctrl);
 
+    let state_close = state.clone();
+    window.connect_close_request(move |win| {
+        let s = state_close.borrow();
+        let config = Config {
+            window_width: win.width(),
+            window_height: win.height(),
+            window_maximized: win.is_maximized(),
+            info_panel_visible: s.info_visible,
+            last_directory: s
+                .current_path()
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().into_owned())),
+        };
+        config.save();
+        glib::Propagation::Proceed
+    });
+
     window.present();
+
+    if let Some(path) = initial_path {
+        if path.is_file() {
+            state.borrow_mut().load_directory(&path);
+            populate_thumbnails();
+            load_image(path);
+        } else if path.is_dir() {
+            state.borrow_mut().load_from_directory(&path);
+            populate_thumbnails();
+            if let Some(first) = state.borrow().current_path() {
+                load_image(first);
+            }
+        }
+    }
 }

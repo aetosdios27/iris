@@ -3,6 +3,9 @@ use super::shader;
 use ash::vk;
 use std::sync::Arc;
 
+use crate::error::{IrisError, IrisResult};
+use crate::vk_check;
+
 pub struct VkPipeline {
     pub context: Arc<VkContext>,
     pub render_pass: vk::RenderPass,
@@ -12,9 +15,13 @@ pub struct VkPipeline {
 }
 
 impl VkPipeline {
-    pub fn new(context: Arc<VkContext>) -> Self {
+    /// Create the full graphics pipeline.
+    ///
+    /// `color_format` must match the `vk::Format` used for the `DmabufImage`
+    /// render targets — this is the negotiated format from `Viewport::new()`.
+    pub fn new(context: Arc<VkContext>, color_format: vk::Format) -> IrisResult<Self> {
         unsafe {
-            // 1. Define Descriptor Layout (Telling Vulkan about our shader inputs)
+            // 1. Descriptor Set Layout
             let bindings = [
                 // Binding 0: Uniform Buffer
                 vk::DescriptorSetLayoutBinding::default()
@@ -37,31 +44,34 @@ impl VkPipeline {
             ];
 
             let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-            let descriptor_set_layout = context
-                .device
-                .create_descriptor_set_layout(&layout_info, None)
-                .expect("Failed to create Descriptor Set Layout");
+            let descriptor_set_layout = vk_check!(
+                context
+                    .device
+                    .create_descriptor_set_layout(&layout_info, None),
+                "vkCreateDescriptorSetLayout"
+            )?;
 
-            // 2. Define Pipeline Layout
+            // 2. Pipeline Layout
             let layouts = [descriptor_set_layout];
             let pipeline_layout_info =
                 vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
-            let pipeline_layout = context
-                .device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-                .expect("Failed to create Pipeline Layout");
+            let pipeline_layout = vk_check!(
+                context
+                    .device
+                    .create_pipeline_layout(&pipeline_layout_info, None),
+                "vkCreatePipelineLayout"
+            )?;
 
-            // 3. Define the Render Pass
-            // We draw into R8G8B8A8_UNORM (our DMA-BUF format)
+            // 3. Render Pass — uses the negotiated format, not hardcoded
             let color_attachment = vk::AttachmentDescription::default()
-                .format(vk::Format::R8G8B8A8_UNORM)
+                .format(color_format)
                 .samples(vk::SampleCountFlags::TYPE_1)
-                .load_op(vk::AttachmentLoadOp::CLEAR) // Clear to background color before drawing
-                .store_op(vk::AttachmentStoreOp::STORE) // Save the result!
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL); // Ready to be exported/read
+                .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
 
             let color_attachment_ref = vk::AttachmentReference::default()
                 .attachment(0)
@@ -75,10 +85,10 @@ impl VkPipeline {
                 .attachments(std::slice::from_ref(&color_attachment))
                 .subpasses(std::slice::from_ref(&subpass));
 
-            let render_pass = context
-                .device
-                .create_render_pass(&render_pass_info, None)
-                .expect("Failed to create Render Pass");
+            let render_pass = vk_check!(
+                context.device.create_render_pass(&render_pass_info, None),
+                "vkCreateRenderPass"
+            )?;
 
             // 4. Compile Shaders
             let shader_src = include_str!("../shaders/image.wgsl");
@@ -98,13 +108,12 @@ impl VkPipeline {
                     .name(&entry_point_fs),
             ];
 
-            // 5. Fixed-Function State (Rasterizer, Viewport, etc.)
-            let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default(); // Hardcoded in shader
+            // 5. Fixed-Function State
+            let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
 
             let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-            // Viewport and Scissor will be dynamic (can change when window resizes)
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
             let dynamic_state =
                 vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
@@ -124,7 +133,7 @@ impl VkPipeline {
 
             let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
-                .blend_enable(true) // Premultiplied alpha blending
+                .blend_enable(true)
                 .src_color_blend_factor(vk::BlendFactor::ONE)
                 .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
                 .color_blend_op(vk::BlendOp::ADD)
@@ -156,18 +165,21 @@ impl VkPipeline {
                     std::slice::from_ref(&pipeline_info),
                     None,
                 )
-                .expect("Failed to create Graphics Pipeline")[0];
+                .map_err(|(_pipelines, code)| IrisError::Vk {
+                    call: "vkCreateGraphicsPipelines",
+                    code,
+                })?[0];
 
-            // Clean up shader module (Pipeline keeps the compiled bytecode)
+            // Clean up shader module (driver retains its own compiled form)
             context.device.destroy_shader_module(shader_module, None);
 
-            Self {
+            Ok(Self {
                 context,
                 render_pass,
                 descriptor_set_layout,
                 pipeline_layout,
                 pipeline,
-            }
+            })
         }
     }
 }
