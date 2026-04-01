@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Iris
+GenericName=Image Viewer
+Comment=A zero-copy GPU-accelerated image viewer
+Exec=iris %F
+Icon=dev.iris.viewer
+Terminal=false
+Categories=Graphics;Viewer;GTK;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/avif;image/tiff;image/bmp;
+StartupNotify=true
+Keywords=image;photo;picture;viewer;gpu;vulkan;

@@ -3,8 +3,9 @@
 use adw::prelude::*;
 use gtk4::prelude::*;
 use gtk4::{FileDialog, Orientation, glib};
+use image::GenericImageView;
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,8 +20,6 @@ mod viewport;
 use config::Config;
 
 const APP_ID: &str = "dev.iris.viewer";
-
-// ── EXIF orientation reader ──────────────────────────────────────────────────
 
 fn read_exif_rotation(path: &Path) -> i32 {
     let file = match std::fs::File::open(path) {
@@ -44,16 +43,12 @@ fn read_exif_rotation(path: &Path) -> i32 {
     }
 }
 
-// ── Per-image view state ─────────────────────────────────────────────────────
-
 #[derive(Clone, Copy)]
 struct ViewState {
     zoom: f32,
     position_x: f32,
     position_y: f32,
 }
-
-// ── AppState ─────────────────────────────────────────────────────────────────
 
 struct AppState {
     files: Vec<PathBuf>,
@@ -62,6 +57,9 @@ struct AppState {
     view_states: HashMap<PathBuf, ViewState>,
     info_visible: bool,
     watched_directory: Option<PathBuf>,
+    /// +1 when navigating forward, -1 backward, 0 neutral.
+    /// Used to bias prefetch in the direction the user is scrubbing.
+    last_nav_direction: i32,
 }
 
 impl AppState {
@@ -73,6 +71,7 @@ impl AppState {
             view_states: HashMap::new(),
             info_visible: false,
             watched_directory: None,
+            last_nav_direction: 0,
         }
     }
 
@@ -107,6 +106,7 @@ impl AppState {
             self.current_index = files.iter().position(|f| f == path).unwrap_or(0);
             self.files = files;
             self.watched_directory = Some(parent.to_path_buf());
+            self.last_nav_direction = 0;
         }
     }
 
@@ -116,6 +116,7 @@ impl AppState {
         self.current_index = 0;
         self.files = files;
         self.watched_directory = Some(dir.to_path_buf());
+        self.last_nav_direction = 0;
     }
 
     fn refresh_watched_directory(&mut self) -> Option<PathBuf> {
@@ -180,49 +181,33 @@ impl AppState {
         self.current_path()
     }
 
+    /// Returns adjacent paths biased by the current navigation direction.
+    /// When scrubbing forward, prefetch more forward images.
+    /// When scrubbing backward, prefetch more backward images.
+    /// When neutral (e.g. thumbnail click), prefetch symmetrically.
     fn adjacent_paths(&self) -> Vec<PathBuf> {
         if self.files.is_empty() {
             return vec![];
         }
         let len = self.files.len();
-        let range = 5.min(len / 2);
-        let mut paths = Vec::new();
-        for offset in 1..=range {
+        let max_neighbors = len.saturating_sub(1);
+
+        let (forward_count, backward_count) = match self.last_nav_direction.signum() {
+            1 => (10.min(max_neighbors), 3.min(max_neighbors)),
+            -1 => (3.min(max_neighbors), 10.min(max_neighbors)),
+            _ => (5.min(max_neighbors), 5.min(max_neighbors)),
+        };
+
+        let mut paths = Vec::with_capacity(forward_count + backward_count);
+        for offset in 1..=forward_count {
             paths.push(self.files[(self.current_index + offset) % len].clone());
         }
-        for offset in 1..=range {
+        for offset in 1..=backward_count {
             paths.push(self.files[(self.current_index + len - offset) % len].clone());
         }
         paths
     }
 }
-
-// ── Async helpers ────────────────────────────────────────────────────────────
-
-async fn load_bytes_async(path: PathBuf) -> Option<Vec<u8>> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    rayon::spawn(move || {
-        let _ = tx.send(std::fs::read(&path).ok());
-    });
-    rx.await.ok().flatten()
-}
-
-fn pixbuf_from_bytes(bytes: &[u8], rotation: i32) -> Option<gtk4::gdk_pixbuf::Pixbuf> {
-    use gtk4::gdk_pixbuf::{PixbufLoader, PixbufRotation};
-    let loader = PixbufLoader::new();
-    loader.write(bytes).ok()?;
-    loader.close().ok()?;
-    let pixbuf = loader.pixbuf()?;
-    let rot = match rotation {
-        90 => PixbufRotation::Clockwise,
-        180 => PixbufRotation::Upsidedown,
-        270 => PixbufRotation::Counterclockwise,
-        _ => PixbufRotation::None,
-    };
-    pixbuf.rotate_simple(rot)
-}
-
-// ── Directory watcher ────────────────────────────────────────────────────────
 
 fn start_directory_watcher(
     state: Rc<RefCell<AppState>>,
@@ -266,7 +251,71 @@ fn start_directory_watcher(
     watcher
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+/// Load or generate a 128×128 RGBA8 thumbnail entirely off the GTK thread.
+fn load_or_generate_thumb(path: &Path) -> Option<Vec<u8>> {
+    let thumb_size = 128u32;
+
+    let cache_dir = dirs::cache_dir()?.join("thumbnails").join("normal");
+    let uri = format!(
+        "file://{}",
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+    );
+    let key = format!("{:x}", md5::compute(uri.as_bytes()));
+    let thumb_path = cache_dir.join(format!("{key}.png"));
+
+    // Try disk cache
+    if let (Ok(src_meta), Ok(thumb_meta)) =
+        (std::fs::metadata(path), std::fs::metadata(&thumb_path))
+    {
+        if let (Ok(src_mtime), Ok(thumb_mtime)) = (src_meta.modified(), thumb_meta.modified()) {
+            if thumb_mtime >= src_mtime {
+                if let Ok(img) = image::open(&thumb_path) {
+                    let rgba = img.to_rgba8();
+                    let resized = image::imageops::resize(
+                        &rgba,
+                        thumb_size,
+                        thumb_size,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    return Some(resized.into_raw());
+                }
+            }
+        }
+    }
+
+    // Cache miss — generate
+    let thumb = if crate::raw::is_raw(path) {
+        let raw_img = crate::raw::decode_raw(path)?;
+        let rgba8 = crate::raw::linear_16_to_srgb_8(&raw_img.data, raw_img.width, raw_img.height);
+        let img = image::RgbaImage::from_raw(raw_img.width, raw_img.height, rgba8)?;
+        image::imageops::resize(
+            &img,
+            thumb_size,
+            thumb_size,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        let img = image::open(path).ok()?.to_rgba8();
+        let (w, h) = img.dimensions();
+        let icc = crate::color::extract_icc_profile(path);
+        let corrected = crate::color::rgba8_to_srgb_with_icc(img.as_raw(), w, h, icc.as_deref());
+        let corrected_img = image::RgbaImage::from_raw(w, h, corrected)?;
+        image::imageops::resize(
+            &corrected_img,
+            thumb_size,
+            thumb_size,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+
+    // Save to disk cache
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = thumb.save_with_format(&thumb_path, image::ImageFormat::Png);
+
+    Some(thumb.into_raw())
+}
 
 fn main() {
     let app = adw::Application::builder()
@@ -285,8 +334,6 @@ fn main() {
 
     app.run();
 }
-
-// ── UI ───────────────────────────────────────────────────────────────────────
 
 fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     if let Some(window) = app.active_window() {
@@ -328,7 +375,6 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let state = Rc::new(RefCell::new(AppState::new()));
     state.borrow_mut().info_visible = cfg.info_panel_visible;
 
-    // ── Header ──────────────────────────────────────────
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
 
@@ -372,7 +418,6 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     header.set_title_widget(Some(&*counter_label));
     toolbar_view.add_top_bar(&header);
 
-    // ── Layout ──────────────────────────────────────────
     let root_box = gtk4::Box::new(Orientation::Vertical, 0);
     let content_box = gtk4::Box::new(Orientation::Horizontal, 0);
     content_box.set_vexpand(true);
@@ -488,6 +533,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     toast_overlay.set_child(Some(&toolbar_view));
     window.set_content(Some(&toast_overlay));
 
+    // ── Navigation coalescing state ───────────────────────────────────────
+    let nav_pending: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+    let nav_scheduled: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+    // ── O(1) thumbnail tracking ───────────────────────────────────────────
+    let prev_active_thumb: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+
     let thumb_buttons: Rc<RefCell<Vec<gtk4::Button>>> = Rc::new(RefCell::new(vec![]));
     let load_image_fn: Rc<RefCell<Option<Rc<dyn Fn(PathBuf)>>>> = Rc::new(RefCell::new(None));
 
@@ -521,6 +573,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         let thumb_buttons = thumb_buttons.clone();
         let state = state.clone();
         let load_fn_ref = load_image_fn.clone();
+        let prev_active = prev_active_thumb.clone();
 
         move || {
             while let Some(child) = thumb_strip.first_child() {
@@ -566,7 +619,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
                 let load_fn_click = load_fn_ref.clone();
                 let path_click = path.clone();
                 btn.connect_clicked(move |_| {
-                    state_click.borrow_mut().current_index = i;
+                    {
+                        let mut s = state_click.borrow_mut();
+                        s.current_index = i;
+                        s.last_nav_direction = 0;
+                    }
                     if let Some(f) = load_fn_click.borrow().as_ref() {
                         f(path_click.clone());
                     }
@@ -580,30 +637,36 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
                 let thumb_stack_async = thumb_stack.clone();
 
                 glib::spawn_future_local(async move {
-                    if let Some(texture) = crate::thumbcache::load(&path_async) {
-                        thumb_pic_async.set_paintable(Some(&texture));
-                        thumb_stack_async.set_visible_child_name("image");
-                        return;
-                    }
-
                     let (tx, rx) = futures::channel::oneshot::channel();
                     rayon::spawn({
                         let path = path_async.clone();
                         move || {
-                            let thumb = crate::thumbcache::generate(&path);
-                            let _ = tx.send(thumb);
+                            let result = load_or_generate_thumb(&path);
+                            let _ = tx.send(result);
                         }
                     });
 
-                    if let Ok(Some(texture)) = rx.await {
+                    if let Ok(Some(bytes)) = rx.await {
+                        let glib_bytes = glib::Bytes::from_owned(bytes);
+                        let texture = gtk4::gdk::MemoryTexture::new(
+                            128,
+                            128,
+                            gtk4::gdk::MemoryFormat::R8g8b8a8,
+                            &glib_bytes,
+                            (128 * 4) as usize,
+                        );
                         thumb_pic_async.set_paintable(Some(&texture));
                     }
                     thumb_stack_async.set_visible_child_name("image");
                 });
             }
+
+            // Sync the O(1) tracker with the freshly created buttons
+            prev_active.set(Some(current_index));
         }
     });
 
+    // ── Core load_image closure ───────────────────────────────────────────
     let load_image: Rc<dyn Fn(PathBuf)> = Rc::new({
         let counter_label = counter_label.clone();
         let state = state.clone();
@@ -615,8 +678,10 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         let viewport_stack = viewport_stack.clone();
         let viewport_engine = viewport.clone();
         let scroll_fn = scroll_to_active_thumb.clone();
+        let prev_active = prev_active_thumb.clone();
 
         move |path: PathBuf| {
+            // ── 1. Save view state of the image we're leaving ─────────────
             {
                 let current = state.borrow().current_path();
                 if let Some(ref current_path) = current {
@@ -634,26 +699,17 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
                 }
             }
 
-            {
-                let mut s = state.borrow_mut();
-                if !s.rotations.contains_key(&path) {
-                    let exif_rot = read_exif_rotation(&path);
-                    if exif_rot != 0 {
-                        s.rotations.insert(path.clone(), exif_rot);
-                    }
-                }
-            }
+            // ── 2. Get rotation from cache (zero I/O) ────────────────────
+            let cached_rotation = state.borrow().rotations.get(&path).copied();
+            let rotation = cached_rotation.unwrap_or(0);
 
-            let (idx, total, rotation, adjacent) = {
+            // ── 3. Gather navigation state ────────────────────────────────
+            let (idx, total, adjacent) = {
                 let s = state.borrow();
-                (
-                    s.current_index,
-                    s.files.len(),
-                    s.current_rotation(),
-                    s.adjacent_paths(),
-                )
+                (s.current_index, s.files.len(), s.adjacent_paths())
             };
 
+            // ── 4. Restore or reset camera for the target image ───────────
             {
                 let s = state.borrow();
                 if let Some(vs) = s.view_states.get(&path) {
@@ -663,6 +719,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
                 }
             }
 
+            // ── 5. Update header / info labels (cheap string ops) ─────────
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -672,43 +729,135 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
             info_name.set_label(&name);
             info_path_lbl.set_label(path.to_str().unwrap_or(""));
 
-            if let Ok(meta) = std::fs::metadata(&path) {
-                let bytes = meta.len();
-                let size_str = if bytes > 1_048_576 {
-                    format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-                } else {
-                    format!("{:.0} KB", bytes as f64 / 1024.0)
-                };
-                info_size.set_label(&size_str);
-            }
-
+            // ── 6. O(1) thumbnail active-state update ─────────────────────
             {
                 let btns = thumb_buttons.borrow();
-                for (i, btn) in btns.iter().enumerate() {
-                    if i == idx {
-                        btn.add_css_class("thumb-active");
-                    } else {
+                if let Some(prev) = prev_active.get() {
+                    if let Some(btn) = btns.get(prev) {
                         btn.remove_css_class("thumb-active");
                     }
                 }
+                if let Some(btn) = btns.get(idx) {
+                    btn.add_css_class("thumb-active");
+                }
+                prev_active.set(Some(idx));
             }
 
+            // ── 7. Scroll thumbnail strip ─────────────────────────────────
             scroll_fn();
+
+            // ── 8. Apply rotation and show viewport ───────────────────────
             viewport_engine.set_rotation(rotation as f32);
             viewport_stack.set_visible_child_name("image");
 
+            // ── 9. Trigger image load (async internally) ──────────────────
             let info_dims_cb = info_dims.clone();
-            viewport_engine.load_image(path, move |w, h| {
+            viewport_engine.load_image(path.clone(), move |w, h| {
                 info_dims_cb.set_label(&format!("{}×{} px", w, h));
             });
 
+            // ── 10. Directional prefetch ──────────────────────────────────
             for adj_path in adjacent {
                 viewport_engine.prefetch(adj_path);
+            }
+
+            // ── 11. Async EXIF rotation (only if not already cached) ──────
+            if cached_rotation.is_none() {
+                let path_exif = path.clone();
+                let state_exif = state.clone();
+                let viewport_exif = viewport_engine.clone();
+                let (tx, rx) = futures::channel::oneshot::channel();
+                rayon::spawn(move || {
+                    let rot = read_exif_rotation(&path_exif);
+                    let _ = tx.send((path_exif, rot));
+                });
+                glib::spawn_future_local({
+                    let state_exif = state_exif.clone();
+                    async move {
+                        if let Ok((p, rot)) = rx.await {
+                            let is_current = {
+                                let mut s = state_exif.borrow_mut();
+                                s.rotations.insert(p.clone(), rot);
+                                s.current_path().as_deref() == Some(p.as_path())
+                            };
+                            if is_current && rot != 0 {
+                                viewport_exif.set_rotation(rot as f32);
+                            }
+                        }
+                    }
+                });
+            }
+
+            // ── 12. Async file-size metadata ──────────────────────────────
+            {
+                info_size.set_label("…");
+                let path_meta = path.clone();
+                let info_size_cb = info_size.clone();
+                let (tx, rx) = futures::channel::oneshot::channel();
+                rayon::spawn(move || {
+                    let size = std::fs::metadata(&path_meta).ok().map(|m| m.len());
+                    let _ = tx.send(size);
+                });
+                glib::spawn_future_local(async move {
+                    if let Ok(Some(bytes)) = rx.await {
+                        let size_str = if bytes > 1_048_576 {
+                            format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+                        } else {
+                            format!("{:.0} KB", bytes as f64 / 1024.0)
+                        };
+                        info_size_cb.set_label(&size_str);
+                    }
+                });
             }
         }
     });
 
     *load_image_fn.borrow_mut() = Some(load_image.clone());
+
+    // ── Navigation coalescing scheduler ───────────────────────────────────
+    // Accumulates rapid key-repeat events and processes them as a single
+    // jump once the GTK main loop drains its event queue.
+    let schedule_nav: Rc<dyn Fn()> = Rc::new({
+        let nav_pending = nav_pending.clone();
+        let nav_scheduled = nav_scheduled.clone();
+        let state = state.clone();
+        let load_image = load_image.clone();
+
+        move || {
+            if nav_scheduled.get() {
+                return;
+            }
+            nav_scheduled.set(true);
+
+            let np = nav_pending.clone();
+            let ns = nav_scheduled.clone();
+            let st = state.clone();
+            let lk = load_image.clone();
+
+            glib::idle_add_local_once(move || {
+                ns.set(false);
+                let delta = np.replace(0);
+                if delta == 0 {
+                    return;
+                }
+                let path = {
+                    let mut s = st.borrow_mut();
+                    let len = s.files.len();
+                    if len == 0 {
+                        return;
+                    }
+                    let new_idx =
+                        (s.current_index as i64 + delta as i64).rem_euclid(len as i64) as usize;
+                    s.current_index = new_idx;
+                    s.last_nav_direction = if delta > 0 { 1 } else { -1 };
+                    s.current_path()
+                };
+                if let Some(p) = path {
+                    lk(p);
+                }
+            });
+        }
+    });
 
     let _watcher = start_directory_watcher(
         state.clone(),
@@ -826,14 +975,18 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     });
     window.add_controller(drop_target);
 
+    // ── Keyboard handler with navigation coalescing ───────────────────────
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+
     let window_key = window.clone();
     let state_key = state.clone();
-    let load_key = load_image.clone();
     let info_panel_key = info_panel.clone();
     let info_sep_key = info_sep.clone();
     let viewport_key = viewport.clone();
+    let nav_pending_key = nav_pending.clone();
+    let schedule_nav_key = schedule_nav.clone();
+
     key_ctrl.connect_key_pressed(move |_, key, _, modifier| match key {
         gtk4::gdk::Key::f | gtk4::gdk::Key::F => {
             window_key.fullscreen();
@@ -844,17 +997,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::Right | gtk4::gdk::Key::space => {
-            let path = state_key.borrow_mut().next();
-            if let Some(p) = path {
-                load_key(p);
-            }
+            nav_pending_key.set(nav_pending_key.get() + 1);
+            schedule_nav_key();
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::Left => {
-            let path = state_key.borrow_mut().prev();
-            if let Some(p) = path {
-                load_key(p);
-            }
+            nav_pending_key.set(nav_pending_key.get() - 1);
+            schedule_nav_key();
             glib::Propagation::Stop
         }
         gtk4::gdk::Key::r | gtk4::gdk::Key::R => {

@@ -14,8 +14,6 @@ use crate::error::{IrisError, IrisResult};
 use crate::viewport::camera::Camera;
 use crate::vk_check;
 
-// ── Uniform buffer layout (must match image.wgsl) ────────────────────────────
-
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct Uniforms {
@@ -26,8 +24,6 @@ struct Uniforms {
     tone_map_enabled: f32,
     hdr_output_enabled: f32,
 }
-
-// ── Per-image GPU texture ─────────────────────────────────────────────────────
 
 struct CachedTexture {
     image: vk::Image,
@@ -40,14 +36,15 @@ struct CachedTexture {
 }
 
 impl CachedTexture {
-    unsafe fn destroy(&self, device: &ash::Device) {
+    unsafe fn destroy(&self, device: &ash::Device, pool: vk::DescriptorPool) {
+        device
+            .free_descriptor_sets(pool, std::slice::from_ref(&self.descriptor_set))
+            .ok();
         device.destroy_image_view(self.image_view, None);
         device.destroy_image(self.image, None);
         device.free_memory(self.memory, None);
     }
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn compute_mip_levels(w: u32, h: u32) -> u32 {
     ((w.max(h) as f32).log2().floor() as u32 + 1).max(1)
@@ -92,8 +89,6 @@ unsafe fn mip_barrier(
         std::slice::from_ref(&barrier),
     );
 }
-
-// ── Processing image (intermediate storage for compute passes) ────────────────
 
 struct ProcessingImage {
     image: vk::Image,
@@ -207,8 +202,6 @@ impl ProcessingImage {
     }
 }
 
-// ── VkRenderer ───────────────────────────────────────────────────────────────
-
 pub struct VkRenderer {
     context: Arc<VkContext>,
     pipeline: VkPipeline,
@@ -245,7 +238,8 @@ pub struct VkRenderer {
     pub format_fourcc: u32,
 
     compute: Option<ComputeInfra>,
-    processing_image: Option<ProcessingImage>,
+    processing_a: Option<ProcessingImage>,
+    processing_b: Option<ProcessingImage>,
     compute_descriptor_pool: vk::DescriptorPool,
     pub active_passes: Vec<ProcessingPass>,
 }
@@ -267,22 +261,22 @@ impl VkRenderer {
             let pool_sizes = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
-                    descriptor_count: 64,
+                    descriptor_count: 256,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::SAMPLED_IMAGE,
-                    descriptor_count: 64,
+                    descriptor_count: 256,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::SAMPLER,
-                    descriptor_count: 64,
+                    descriptor_count: 256,
                 },
             ];
 
             let descriptor_pool = vk_check!(
                 context.device.create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(64)
+                        .max_sets(256)
                         .pool_sizes(&pool_sizes)
                         .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
                     None,
@@ -470,7 +464,8 @@ impl VkRenderer {
                 vk_format,
                 format_fourcc,
                 compute,
-                processing_image: None,
+                processing_a: None,
+                processing_b: None,
                 compute_descriptor_pool,
                 active_passes: Vec::new(),
             };
@@ -485,8 +480,6 @@ impl VkRenderer {
         }
     }
 
-    // ── Public API ───────────────────────────────────────────────────────────
-
     pub fn resize(&mut self, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -496,11 +489,14 @@ impl VkRenderer {
         }
 
         unsafe {
+            // Wait for any in-flight work to complete.
+            // Do NOT reset fences — leave them signaled so the next
+            // wait_fence() in render() returns immediately.
+            // render()'s wait_fence already resets the fence it uses.
             let _ = self
                 .context
                 .device
                 .wait_for_fences(&self.fences, true, u64::MAX);
-            let _ = self.context.device.reset_fences(&self.fences);
 
             for i in 0..2 {
                 self.context
@@ -536,21 +532,36 @@ impl VkRenderer {
                 }
             }
 
-            if let Some(ref pi) = self.processing_image {
+            if let Some(ref pi) = self.processing_a {
+                pi.destroy(&self.context.device);
+            }
+            if let Some(ref pi) = self.processing_b {
                 pi.destroy(&self.context.device);
             }
             if !self.active_passes.is_empty() {
-                match ProcessingImage::new(&self.context, width, height, self.vk_format) {
-                    Ok(pi) => self.processing_image = Some(pi),
-                    Err(e) => {
-                        eprintln!("[Iris] resize processing image failed: {e}");
-                        self.processing_image = None;
+                match (
+                    ProcessingImage::new(&self.context, width, height, self.vk_format),
+                    ProcessingImage::new(&self.context, width, height, self.vk_format),
+                ) {
+                    (Ok(a), Ok(b)) => {
+                        self.processing_a = Some(a);
+                        self.processing_b = Some(b);
+                    }
+                    _ => {
+                        eprintln!("[Iris] resize processing images failed");
+                        self.processing_a = None;
+                        self.processing_b = None;
                     }
                 }
             }
 
             self.framebuffer_width = width;
             self.framebuffer_height = height;
+            // Reset frame index so the next render uses slot 0.
+            // Both fences are signaled after wait_for_fences above,
+            // so slot 0's fence will be immediately reset by wait_fence()
+            // before submission, and slot 1 stays signaled until its turn.
+            self.frame_index = 0;
             self.dirty = true;
         }
     }
@@ -606,21 +617,28 @@ impl VkRenderer {
         }
 
         unsafe {
-            if !self.active_passes.is_empty() && self.processing_image.is_none() {
-                match ProcessingImage::new(
-                    &self.context,
-                    self.framebuffer_width,
-                    self.framebuffer_height,
-                    self.vk_format,
+            if !self.active_passes.is_empty() && self.processing_a.is_none() {
+                let w = self.framebuffer_width;
+                let h = self.framebuffer_height;
+                match (
+                    ProcessingImage::new(&self.context, w, h, self.vk_format),
+                    ProcessingImage::new(&self.context, w, h, self.vk_format),
                 ) {
-                    Ok(pi) => self.processing_image = Some(pi),
-                    Err(e) => eprintln!("[Iris] processing image alloc failed: {e}"),
+                    (Ok(a), Ok(b)) => {
+                        self.processing_a = Some(a);
+                        self.processing_b = Some(b);
+                    }
+                    _ => eprintln!("[Iris] processing image alloc failed"),
                 }
             } else if self.active_passes.is_empty() {
-                if let Some(ref pi) = self.processing_image {
+                if let Some(ref pi) = self.processing_a {
                     pi.destroy(&self.context.device);
                 }
-                self.processing_image = None;
+                if let Some(ref pi) = self.processing_b {
+                    pi.destroy(&self.context.device);
+                }
+                self.processing_a = None;
+                self.processing_b = None;
             }
         }
 
@@ -640,6 +658,13 @@ impl VkRenderer {
             Some(p) => p.clone(),
             None => return,
         };
+
+        // Don't render the blank placeholder during resize — it causes
+        // a fence stall because the compositor may still hold the previous
+        // 1×1 DMA-BUF from the initial blank render.
+        if active_path == PathBuf::from("__blank__") && self.framebuffer_width > 1 {
+            return;
+        }
 
         let descriptor_set = match self.cache.get(&active_path) {
             Some(c) => c.descriptor_set,
@@ -707,8 +732,6 @@ impl VkRenderer {
     fn presented_slot(&self) -> usize {
         self.frame_index.wrapping_sub(1) % 2
     }
-
-    // ── Private helpers ──────────────────────────────────────────────────────
 
     fn activate(&mut self, path: &Path) {
         if let Some(c) = self.cache.get(path) {
@@ -877,9 +900,9 @@ impl VkRenderer {
             }
         };
 
-        let pi = match &self.processing_image {
-            Some(pi) => pi,
-            None => {
+        let (pi_a, pi_b) = match (&self.processing_a, &self.processing_b) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
                 match self.render_targets[slot].blit_render_to_export_async() {
                     Ok(fd) => self.last_sync_fd = Some(fd),
                     Err(e) => eprintln!("[Iris] blit fallback: {e}"),
@@ -917,7 +940,18 @@ impl VkRenderer {
         super::dmabuf::image_layout_transition(
             &self.context.device,
             cmd,
-            pi.image,
+            pi_a.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::GENERAL,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::SHADER_WRITE,
+        );
+        super::dmabuf::image_layout_transition(
+            &self.context.device,
+            cmd,
+            pi_b.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::GENERAL,
             vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -927,9 +961,16 @@ impl VkRenderer {
         );
 
         let passes = self.active_passes.clone();
+        let targets = [pi_a, pi_b];
         let mut current_input_view = render_view;
+        let mut current_input_image = render_image;
+        let mut current_input_is_render = true;
+        let mut last_output_idx: usize = 0;
 
         for (i, pass) in passes.iter().enumerate() {
+            let output_idx = i % 2;
+            let output_target = targets[output_idx];
+
             let params = match pass {
                 ProcessingPass::Enhance => ComputeParams {
                     width: self.framebuffer_width,
@@ -953,6 +994,20 @@ impl VkRenderer {
 
             compute.write_params(&params);
 
+            if !current_input_is_render {
+                super::dmabuf::image_layout_transition(
+                    &self.context.device,
+                    cmd,
+                    current_input_image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::AccessFlags::SHADER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                );
+            }
+
             let desc_set = self
                 .context
                 .device
@@ -971,7 +1026,7 @@ impl VkRenderer {
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
             let output_info = vk::DescriptorImageInfo::default()
-                .image_view(pi.image_view)
+                .image_view(output_target.image_view)
                 .image_layout(vk::ImageLayout::GENERAL);
 
             let params_info = vk::DescriptorBufferInfo::default()
@@ -1017,39 +1072,18 @@ impl VkRenderer {
             let groups_y = (self.framebuffer_height + 15) / 16;
             self.context.device.cmd_dispatch(cmd, groups_x, groups_y, 1);
 
-            if i + 1 < passes.len() {
-                super::dmabuf::image_layout_transition(
-                    &self.context.device,
-                    cmd,
-                    pi.image,
-                    vk::ImageLayout::GENERAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::AccessFlags::SHADER_WRITE,
-                    vk::AccessFlags::SHADER_READ,
-                );
-
-                current_input_view = pi.image_view;
-
-                super::dmabuf::image_layout_transition(
-                    &self.context.device,
-                    cmd,
-                    pi.image,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::ImageLayout::GENERAL,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::AccessFlags::SHADER_READ,
-                    vk::AccessFlags::SHADER_WRITE,
-                );
-            }
+            current_input_view = output_target.image_view;
+            current_input_image = output_target.image;
+            current_input_is_render = false;
+            last_output_idx = output_idx;
         }
+
+        let final_output = targets[last_output_idx];
 
         super::dmabuf::image_layout_transition(
             &self.context.device,
             cmd,
-            pi.image,
+            final_output.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1080,7 +1114,7 @@ impl VkRenderer {
             "vkResetDescriptorPool(compute)"
         )?;
 
-        match self.render_targets[slot].blit_external_to_export_async(pi.image) {
+        match self.render_targets[slot].blit_external_to_export_async(final_output.image) {
             Ok(fd) => self.last_sync_fd = Some(fd),
             Err(e) => eprintln!("[Iris] blit_external_to_export_async: {e}"),
         }
@@ -1090,12 +1124,23 @@ impl VkRenderer {
             super::dmabuf::image_layout_transition(
                 &self.context.device,
                 cmd,
-                pi.image,
+                pi_a.image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::AccessFlags::TRANSFER_READ,
+                vk::AccessFlags::SHADER_WRITE,
+            );
+            super::dmabuf::image_layout_transition(
+                &self.context.device,
+                cmd,
+                pi_b.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::empty(),
                 vk::AccessFlags::SHADER_WRITE,
             );
             self.context.end_one_shot_commands(cmd)?;
@@ -1106,7 +1151,7 @@ impl VkRenderer {
 
     fn upload_texture(&mut self, path: &Path, rgba: &[u8], w: u32, h: u32) {
         if let Some(old) = self.cache.remove(path) {
-            unsafe { old.destroy(&self.context.device) };
+            unsafe { old.destroy(&self.context.device, self.descriptor_pool) };
             self.cache_memory_used = self.cache_memory_used.saturating_sub(old.memory_bytes);
             self.cache_order.retain(|p| p != path);
         }
@@ -1140,7 +1185,7 @@ impl VkRenderer {
                 _ => break,
             };
             if let Some(evicted) = self.cache.remove(&oldest) {
-                unsafe { evicted.destroy(&self.context.device) };
+                unsafe { evicted.destroy(&self.context.device, self.descriptor_pool) };
                 self.cache_memory_used =
                     self.cache_memory_used.saturating_sub(evicted.memory_bytes);
                 self.cache_order.pop();
@@ -1171,7 +1216,7 @@ impl VkRenderer {
 
     fn upload_texture_16bit(&mut self, path: &Path, rgba16: &[u16], w: u32, h: u32) {
         if let Some(old) = self.cache.remove(path) {
-            unsafe { old.destroy(&self.context.device) };
+            unsafe { old.destroy(&self.context.device, self.descriptor_pool) };
             self.cache_memory_used = self.cache_memory_used.saturating_sub(old.memory_bytes);
             self.cache_order.retain(|p| p != path);
         }
@@ -1209,7 +1254,7 @@ impl VkRenderer {
                 _ => break,
             };
             if let Some(evicted) = self.cache.remove(&oldest) {
-                unsafe { evicted.destroy(&self.context.device) };
+                unsafe { evicted.destroy(&self.context.device, self.descriptor_pool) };
                 self.cache_memory_used =
                     self.cache_memory_used.saturating_sub(evicted.memory_bytes);
                 self.cache_order.pop();
@@ -1247,10 +1292,13 @@ impl Drop for VkRenderer {
                 .wait_for_fences(&self.fences, true, u64::MAX);
 
             for (_, tex) in self.cache.drain() {
-                tex.destroy(&self.context.device);
+                tex.destroy(&self.context.device, self.descriptor_pool);
             }
 
-            if let Some(ref pi) = self.processing_image {
+            if let Some(ref pi) = self.processing_a {
+                pi.destroy(&self.context.device);
+            }
+            if let Some(ref pi) = self.processing_b {
                 pi.destroy(&self.context.device);
             }
 
@@ -1280,8 +1328,6 @@ impl Drop for VkRenderer {
         }
     }
 }
-
-// ── Free functions ────────────────────────────────────────────────────────────
 
 unsafe fn create_framebuffer(
     device: &ash::Device,
@@ -1335,7 +1381,6 @@ unsafe fn upload_rgba_texture(
     let staging_req = context
         .device
         .get_buffer_memory_requirements(staging_buffer);
-
     let staging_mem_idx = context
         .find_memory_type_index(
             &staging_req,
@@ -1403,7 +1448,6 @@ unsafe fn upload_rgba_texture(
         })?;
 
     let tex_req = context.device.get_image_memory_requirements(image);
-
     let tex_mem_idx = context
         .find_memory_type_index(&tex_req, vk::MemoryPropertyFlags::DEVICE_LOCAL)
         .ok_or(IrisError::NoMemoryType("texture image"))?;
@@ -1431,7 +1475,6 @@ unsafe fn upload_rgba_texture(
 
     {
         let cmd = context.begin_one_shot_commands()?;
-
         mip_barrier(
             &context.device,
             cmd,
@@ -1446,9 +1489,6 @@ unsafe fn upload_rgba_texture(
         );
 
         let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1456,7 +1496,6 @@ unsafe fn upload_rgba_texture(
                     .base_array_layer(0)
                     .layer_count(1),
             )
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
             .image_extent(vk::Extent3D {
                 width: w,
                 height: h,
@@ -1473,7 +1512,6 @@ unsafe fn upload_rgba_texture(
 
         let mut mip_w = w as i32;
         let mut mip_h = h as i32;
-
         for i in 1..mip_levels {
             mip_barrier(
                 &context.device,
@@ -1487,7 +1525,6 @@ unsafe fn upload_rgba_texture(
                 vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::TRANSFER_READ,
             );
-
             mip_barrier(
                 &context.device,
                 cmd,
@@ -1503,21 +1540,14 @@ unsafe fn upload_rgba_texture(
 
             let next_w = (mip_w / 2).max(1);
             let next_h = (mip_h / 2).max(1);
-
-            let src_subresource = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(i - 1)
-                .base_array_layer(0)
-                .layer_count(1);
-
-            let dst_subresource = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(i)
-                .base_array_layer(0)
-                .layer_count(1);
-
             let blit = vk::ImageBlit::default()
-                .src_subresource(src_subresource)
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i - 1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
                 .src_offsets([
                     vk::Offset3D { x: 0, y: 0, z: 0 },
                     vk::Offset3D {
@@ -1526,7 +1556,13 @@ unsafe fn upload_rgba_texture(
                         z: 1,
                     },
                 ])
-                .dst_subresource(dst_subresource)
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
                 .dst_offsets([
                     vk::Offset3D { x: 0, y: 0, z: 0 },
                     vk::Offset3D {
@@ -1558,7 +1594,6 @@ unsafe fn upload_rgba_texture(
                 vk::AccessFlags::TRANSFER_READ,
                 vk::AccessFlags::SHADER_READ,
             );
-
             mip_w = next_w;
             mip_h = next_h;
         }
@@ -1575,7 +1610,6 @@ unsafe fn upload_rgba_texture(
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
-
         context.end_one_shot_commands(cmd)?;
     }
 
@@ -1613,15 +1647,13 @@ unsafe fn upload_rgba_texture(
         sampler,
     )?;
 
-    let memory_bytes = (w as u64) * (h as u64) * 4;
-
     Ok(CachedTexture {
         image,
         image_view,
         memory,
         descriptor_set,
         dims: (w, h),
-        memory_bytes,
+        memory_bytes: (w as u64) * (h as u64) * 4,
         dynamic_range: DynamicRange::Sdr,
     })
 }
@@ -1656,7 +1688,6 @@ unsafe fn upload_rgba16_texture(
     let staging_req = context
         .device
         .get_buffer_memory_requirements(staging_buffer);
-
     let staging_mem_idx = context
         .find_memory_type_index(
             &staging_req,
@@ -1692,7 +1723,6 @@ unsafe fn upload_rgba16_texture(
             stage: "staging buffer map (16bit)",
             code: c,
         })? as *mut u8;
-
     let raw_bytes: &[u8] = bytemuck::cast_slice(rgba16);
     std::ptr::copy_nonoverlapping(raw_bytes.as_ptr(), ptr, raw_bytes.len());
     context.device.unmap_memory(staging_memory);
@@ -1726,7 +1756,6 @@ unsafe fn upload_rgba16_texture(
         })?;
 
     let tex_req = context.device.get_image_memory_requirements(image);
-
     let tex_mem_idx = context
         .find_memory_type_index(&tex_req, vk::MemoryPropertyFlags::DEVICE_LOCAL)
         .ok_or(IrisError::NoMemoryType("texture image (16bit)"))?;
@@ -1754,7 +1783,6 @@ unsafe fn upload_rgba16_texture(
 
     {
         let cmd = context.begin_one_shot_commands()?;
-
         mip_barrier(
             &context.device,
             cmd,
@@ -1769,9 +1797,6 @@ unsafe fn upload_rgba16_texture(
         );
 
         let region = vk::BufferImageCopy::default()
-            .buffer_offset(0)
-            .buffer_row_length(0)
-            .buffer_image_height(0)
             .image_subresource(
                 vk::ImageSubresourceLayers::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1779,7 +1804,6 @@ unsafe fn upload_rgba16_texture(
                     .base_array_layer(0)
                     .layer_count(1),
             )
-            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
             .image_extent(vk::Extent3D {
                 width: w,
                 height: h,
@@ -1796,7 +1820,6 @@ unsafe fn upload_rgba16_texture(
 
         let mut mip_w = w as i32;
         let mut mip_h = h as i32;
-
         for i in 1..mip_levels {
             mip_barrier(
                 &context.device,
@@ -1810,7 +1833,6 @@ unsafe fn upload_rgba16_texture(
                 vk::AccessFlags::TRANSFER_WRITE,
                 vk::AccessFlags::TRANSFER_READ,
             );
-
             mip_barrier(
                 &context.device,
                 cmd,
@@ -1826,21 +1848,14 @@ unsafe fn upload_rgba16_texture(
 
             let next_w = (mip_w / 2).max(1);
             let next_h = (mip_h / 2).max(1);
-
-            let src_subresource = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(i - 1)
-                .base_array_layer(0)
-                .layer_count(1);
-
-            let dst_subresource = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(i)
-                .base_array_layer(0)
-                .layer_count(1);
-
             let blit = vk::ImageBlit::default()
-                .src_subresource(src_subresource)
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i - 1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
                 .src_offsets([
                     vk::Offset3D { x: 0, y: 0, z: 0 },
                     vk::Offset3D {
@@ -1849,7 +1864,13 @@ unsafe fn upload_rgba16_texture(
                         z: 1,
                     },
                 ])
-                .dst_subresource(dst_subresource)
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(i)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
                 .dst_offsets([
                     vk::Offset3D { x: 0, y: 0, z: 0 },
                     vk::Offset3D {
@@ -1881,7 +1902,6 @@ unsafe fn upload_rgba16_texture(
                 vk::AccessFlags::TRANSFER_READ,
                 vk::AccessFlags::SHADER_READ,
             );
-
             mip_w = next_w;
             mip_h = next_h;
         }
@@ -1898,7 +1918,6 @@ unsafe fn upload_rgba16_texture(
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
-
         context.end_one_shot_commands(cmd)?;
     }
 
@@ -1936,15 +1955,13 @@ unsafe fn upload_rgba16_texture(
         sampler,
     )?;
 
-    let memory_bytes = (w as u64) * (h as u64) * 8;
-
     Ok(CachedTexture {
         image,
         image_view,
         memory,
         descriptor_set,
         dims: (w, h),
-        memory_bytes,
+        memory_bytes: (w as u64) * (h as u64) * 8,
         dynamic_range: DynamicRange::Hdr,
     })
 }
@@ -1994,11 +2011,9 @@ unsafe fn allocate_descriptor_set(
         .buffer(uniform_buffer)
         .offset(0)
         .range(std::mem::size_of::<Uniforms>() as u64);
-
     let image_info = vk::DescriptorImageInfo::default()
         .image_view(image_view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-
     let sampler_info = vk::DescriptorImageInfo::default().sampler(sampler);
 
     let writes = [
@@ -2018,7 +2033,6 @@ unsafe fn allocate_descriptor_set(
             .descriptor_type(vk::DescriptorType::SAMPLER)
             .image_info(std::slice::from_ref(&sampler_info)),
     ];
-
     device.update_descriptor_sets(&writes, &[]);
 
     Ok(descriptor_set)

@@ -125,6 +125,7 @@ pub struct Viewport {
     on_error: Rc<dyn Fn(String)>,
     animation: Rc<RefCell<Option<AnimationState>>>,
     anim_generation: Rc<Cell<u64>>,
+    resize_scheduled: Rc<Cell<bool>>,
 }
 
 impl Viewport {
@@ -167,6 +168,7 @@ impl Viewport {
         let drag_start_y = Rc::new(Cell::new(0.0f64));
         let drag_cam_x = Rc::new(Cell::new(0.0f32));
         let drag_cam_y = Rc::new(Cell::new(0.0f32));
+        let resize_scheduled = Rc::new(Cell::new(false));
 
         // ── Scroll zoom ───────────────────────────────────────────────────────
         {
@@ -249,33 +251,30 @@ impl Viewport {
             widget.add_controller(cc);
         }
 
-        // ── Automatic resize ──────────────────────────────────────────────────
+        // ── Automatic resize (deduplicated) ───────────────────────────────────
         {
             let r2 = renderer.clone();
             let c2 = camera.clone();
             let p2 = picture.clone();
+            let rs = resize_scheduled.clone();
             size_sensor.connect_resize(move |_, new_w, new_h| {
                 let new_w = new_w as u32;
                 let new_h = new_h as u32;
                 if new_w == 0 || new_h == 0 {
                     return;
                 }
-                let unchanged = {
-                    let opt = r2.borrow();
-                    match opt.as_ref() {
-                        Some(r) => {
-                            r.render_target_width() == new_w && r.render_target_height() == new_h
-                        }
-                        None => true,
-                    }
-                };
-                if unchanged {
+                // If a resize render is already scheduled, skip.
+                // The scheduled callback picks up the latest size via sync_size.
+                if rs.get() {
                     return;
                 }
+                rs.set(true);
                 let r3 = r2.clone();
                 let c3 = c2.clone();
                 let p3 = p2.clone();
+                let rs2 = rs.clone();
                 glib::idle_add_local_once(move || {
+                    rs2.set(false);
                     trigger_render(&r3, &c3, &p3);
                 });
             });
@@ -295,6 +294,7 @@ impl Viewport {
             on_error,
             animation: Rc::new(RefCell::new(None)),
             anim_generation: Rc::new(Cell::new(0)),
+            resize_scheduled,
         }
     }
 
@@ -319,7 +319,8 @@ impl Viewport {
     }
 
     pub fn prefetch(&self, path: PathBuf) {
-        if might_be_animated(&path) || raw::is_raw(&path) {
+        // Allow RAW prefetch — decode runs on rayon, upload is cheap
+        if might_be_animated(&path) {
             return;
         }
 
@@ -334,20 +335,44 @@ impl Viewport {
             return;
         }
 
-        let (tx, rx) = oneshot::channel::<Result<image::DynamicImage, image::ImageError>>();
+        let is_raw_file = raw::is_raw(&path);
+
+        let (tx, rx) = oneshot::channel::<Option<DecodedImage>>();
         let path_load = path.clone();
         rayon::spawn(move || {
-            let _ = tx.send(image::open(&path_load));
+            let result = if is_raw_file {
+                decode_raw_image(&path_load)
+            } else {
+                decode_standard_image(&path_load)
+            };
+            let _ = tx.send(result);
         });
 
         let r2 = self.renderer.clone();
         glib::spawn_future_local(async move {
-            let Ok(Ok(img)) = rx.await else { return };
-            let rgba = img.to_rgba8();
-            let (w, h) = (rgba.width(), rgba.height());
+            let Some(decoded) = rx.await.ok().flatten() else {
+                return;
+            };
             let mut opt = r2.borrow_mut();
             if let Some(ref mut r) = *opt {
-                r.cache_only(&path, rgba.as_raw(), w, h);
+                match &decoded {
+                    DecodedImage::Rgba8 {
+                        rgba,
+                        width,
+                        height,
+                        ..
+                    } => {
+                        r.cache_only(&path, rgba, *width, *height);
+                    }
+                    DecodedImage::Rgba16 {
+                        data,
+                        width,
+                        height,
+                        ..
+                    } => {
+                        r.cache_only_16bit(&path, data, *width, *height);
+                    }
+                }
             }
         });
     }
@@ -480,6 +505,7 @@ impl Viewport {
     where
         F: FnOnce(u32, u32) + 'static,
     {
+        // ── Cache hit: activate and render immediately ────────────────────
         {
             let mut opt = self.renderer.borrow_mut();
             if let Some(ref mut r) = *opt {
@@ -495,6 +521,7 @@ impl Viewport {
             }
         }
 
+        // ── Cache miss: decode off-thread ─────────────────────────────────
         let is_raw_file = raw::is_raw(&path);
 
         let (tx, rx) = oneshot::channel::<Option<DecodedImage>>();
@@ -526,6 +553,7 @@ impl Viewport {
             let (w, h) = decoded.dimensions();
 
             if !still_target {
+                // Image is no longer the active target — cache it silently
                 let mut opt = r2.borrow_mut();
                 if let Some(ref mut r) = *opt {
                     match &decoded {
@@ -550,6 +578,7 @@ impl Viewport {
                 return;
             }
 
+            // Upload, activate, render, present
             {
                 let mut opt = r2.borrow_mut();
                 if let Some(ref mut r) = *opt {
@@ -935,14 +964,19 @@ fn trigger_render(
 ) {
     sync_size(renderer, camera, picture);
 
-    {
+    let did_render = {
         let mut opt = renderer.borrow_mut();
         let Some(ref mut r) = *opt else { return };
         r.dirty = true;
         r.render(&camera.borrow());
-    }
+        // render() sets dirty=false if it actually rendered.
+        // If it returned early (no active image, blank, etc.) dirty stays true.
+        !r.dirty
+    };
 
-    present_frame(renderer, picture);
+    if did_render {
+        present_frame(renderer, picture);
+    }
 }
 
 fn present_frame(renderer: &Rc<RefCell<Option<VkRenderer>>>, picture: &Picture) {
@@ -962,15 +996,24 @@ fn present_frame(renderer: &Rc<RefCell<Option<VkRenderer>>>, picture: &Picture) 
         return;
     }
 
+    // Consume the sync_fd from the blit semaphore export.
+    // Must always be taken to prevent accumulation, even if DMA-BUF fails.
+    let sync_fd = {
+        let mut opt = renderer.borrow_mut();
+        opt.as_mut().and_then(|r| r.take_sync_fd())
+    };
+
     let dmabuf_ok = if let Some(fd) = fd {
-        let sync_fd = {
-            let mut opt = renderer.borrow_mut();
-            opt.as_mut().and_then(|r| r.take_sync_fd())
-        };
-        try_push_dmabuf(picture, w, h, fourcc, fd, stride, sync_fd)
+        try_push_dmabuf(picture, w, h, fourcc, fd, stride)
     } else {
         false
     };
+
+    // Close sync_fd AFTER the DMA-BUF texture is built and set,
+    // giving the compositor a window to observe implicit sync.
+    if let Some(sfd) = sync_fd {
+        unsafe { libc::close(sfd) };
+    }
 
     if !dmabuf_ok {
         let pixels = {
@@ -991,7 +1034,6 @@ fn try_push_dmabuf(
     fourcc: u32,
     fd: std::os::fd::RawFd,
     stride: u32,
-    sync_fd: Option<std::os::fd::RawFd>,
 ) -> bool {
     let builder = gdk::DmabufTextureBuilder::new();
     builder.set_width(width);
@@ -1003,17 +1045,15 @@ fn try_push_dmabuf(
     builder.set_stride(0, stride);
     builder.set_offset(0, 0);
 
-    if let Some(sfd) = sync_fd {
-        unsafe { libc::close(sfd) };
-    }
-
     match unsafe { builder.build() } {
         Ok(texture) => {
             picture.set_paintable(Some(&texture));
             true
         }
         Err(e) => {
-            eprintln!("[Iris] DmabufTexture build failed (X11 fallback active): {e}");
+            eprintln!("[Iris] DmabufTexture build failed: {e}");
+            // GDK does not take ownership of the fd on failure — close it.
+            unsafe { libc::close(fd) };
             false
         }
     }

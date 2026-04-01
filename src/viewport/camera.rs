@@ -39,13 +39,9 @@ impl Camera {
 
         let viewport_aspect = vw / vh;
 
-        // Normalize rotation to 0..360 degrees
         let deg = ((self.rotation.to_degrees().round() as i32) % 360 + 360) % 360;
         let is_sideways = deg == 90 || deg == 270;
 
-        // After rotation, the effective image dimensions change:
-        // - 0°/180°: width and height stay the same
-        // - 90°/270°: width and height swap
         let (eff_w, eff_h) = if is_sideways {
             (image_height, image_width)
         } else {
@@ -53,38 +49,97 @@ impl Camera {
         };
 
         let eff_aspect = eff_w / eff_h;
-
-        // After rotation in the shader:
-        // - 0°/180°: visual_width ∝ scale_x, visual_height ∝ scale_y (normal)
-        // - 90°/270°: visual_width ∝ scale_y, visual_height ∝ scale_x (swapped)
-        //
-        // We compute the ratio to fit the effective image into the viewport,
-        // then assign scale_x and scale_y accordingly.
-
         let ratio = eff_aspect / viewport_aspect;
 
         if is_sideways {
-            // Rotation swaps axes: scale_y controls visual width, scale_x controls visual height
             if ratio <= 1.0 {
-                // Effective image is taller than viewport → fit to height
-                // visual_height fills viewport (scale_x = 1.0)
-                // visual_width is smaller (scale_y = ratio)
                 [1.0, ratio]
             } else {
-                // Effective image is wider than viewport → fit to width
-                // visual_width fills viewport (scale_y = 1.0)
-                // visual_height is smaller (scale_x = 1/ratio)
                 [1.0 / ratio, 1.0]
             }
         } else {
-            // No swap: scale_x controls visual width, scale_y controls visual height
             if ratio <= 1.0 {
-                // Image taller → fit to height
                 [ratio, 1.0]
             } else {
-                // Image wider → fit to width
                 [1.0, 1.0 / ratio]
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: f32, b: f32) {
+        assert!(
+            (a - b).abs() < 0.0001,
+            "expected {a} ≈ {b}, diff={}",
+            (a - b).abs()
+        );
+    }
+
+    #[test]
+    fn fit_scale_landscape_image_in_landscape_viewport() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(1600, 900); // 16:9
+        let scale = cam.fit_scale(4000.0, 3000.0); // 4:3
+
+        approx_eq(scale[0], 0.75);
+        approx_eq(scale[1], 1.0);
+    }
+
+    #[test]
+    fn fit_scale_portrait_image_in_landscape_viewport() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(1600, 900);
+        let scale = cam.fit_scale(3000.0, 4000.0);
+
+        approx_eq(scale[0], 0.421875);
+        approx_eq(scale[1], 1.0);
+    }
+
+    #[test]
+    fn fit_scale_sideways_90_swaps_axes_correctly() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(1600, 900);
+        cam.set_rotation_degrees(90.0);
+
+        let scale = cam.fit_scale(4000.0, 3000.0);
+
+        approx_eq(scale[0], 1.0);
+        approx_eq(scale[1], 0.421875);
+    }
+
+    #[test]
+    fn fit_scale_sideways_270_swaps_axes_correctly() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(1600, 900);
+        cam.set_rotation_degrees(270.0);
+
+        let scale = cam.fit_scale(4000.0, 3000.0);
+
+        approx_eq(scale[0], 1.0);
+        approx_eq(scale[1], 0.421875);
+    }
+
+    #[test]
+    fn fit_scale_wide_image_fits_width() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(1600, 900);
+        let scale = cam.fit_scale(5000.0, 1000.0);
+
+        approx_eq(scale[0], 1.0);
+        approx_eq(scale[1], 0.35555556);
+    }
+
+    #[test]
+    fn fit_scale_invalid_inputs_returns_identity() {
+        let mut cam = Camera::new();
+        cam.set_viewport_size(0, 0);
+
+        let scale = cam.fit_scale(0.0, 0.0);
+        approx_eq(scale[0], 1.0);
+        approx_eq(scale[1], 1.0);
     }
 }

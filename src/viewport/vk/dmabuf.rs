@@ -108,24 +108,7 @@ impl DmabufImage {
                 "vkCreateImageView(render)"
             )?;
 
-            // ── 3. Transition render image ────────────────────────────────────
-            {
-                let cmd = context.begin_one_shot_commands()?;
-                image_layout_transition(
-                    &context.device,
-                    cmd,
-                    render_image,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::AccessFlags::empty(),
-                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                );
-                context.end_one_shot_commands(cmd)?;
-            }
-
-            // ── 4. Export image ───────────────────────────────────────────────
+            // ── 3. Export image ────────────────────────────────────────────────
             let mut ext_img_info = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
 
@@ -182,9 +165,26 @@ impl DmabufImage {
                 "vkBindImageMemory(export)"
             )?;
 
-            // ── 5. Transition export image ────────────────────────────────────
+            // ── 4. Transition BOTH images in a single command buffer ──────────
+            //
+            // Previously this was two separate one-shot commands (two submits,
+            // two fence waits). Merging saves one full GPU sync round-trip per
+            // DmabufImage creation (×2 during resize = 2 stalls eliminated).
             {
                 let cmd = context.begin_one_shot_commands()?;
+
+                image_layout_transition(
+                    &context.device,
+                    cmd,
+                    render_image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                );
+
                 image_layout_transition(
                     &context.device,
                     cmd,
@@ -196,10 +196,11 @@ impl DmabufImage {
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::TRANSFER_WRITE,
                 );
+
                 context.end_one_shot_commands(cmd)?;
             }
 
-            // ── 6. Extract DMA-BUF fd ─────────────────────────────────────────
+            // ── 5. Extract DMA-BUF fd ─────────────────────────────────────────
             let ext_mem_fd =
                 ash::khr::external_memory_fd::Device::new(&context.instance, &context.device);
 
@@ -211,7 +212,7 @@ impl DmabufImage {
                 )
                 .map_err(IrisError::DmaBufExport)?;
 
-            // ── 7. Query stride ───────────────────────────────────────────────
+            // ── 6. Query stride ───────────────────────────────────────────────
             let layout = context.device.get_image_subresource_layout(
                 export_image,
                 vk::ImageSubresource {
@@ -222,7 +223,7 @@ impl DmabufImage {
             );
             let stride = layout.row_pitch as u32;
 
-            // ── 8. Async blit resources ───────────────────────────────────────
+            // ── 7. Async blit resources ───────────────────────────────────────
             let blit_command_buffer = context.alloc_command_buffer()?;
 
             let blit_fence = vk_check!(
@@ -264,7 +265,11 @@ impl DmabufImage {
         }
     }
 
-    /// Blit render → export asynchronously and return a Linux sync_fd.
+    /// Copy render image → export image asynchronously and return a Linux sync_fd.
+    ///
+    /// Uses `vkCmdCopyImage` instead of `vkCmdBlitImage` because src and dst
+    /// always have identical dimensions. Copy is a direct DMA transfer and
+    /// avoids the rasterizer path that blit uses.
     pub fn blit_render_to_export_async(&self) -> IrisResult<RawFd> {
         unsafe {
             vk_check!(
@@ -321,34 +326,22 @@ impl DmabufImage {
                 .base_array_layer(0)
                 .layer_count(1);
 
-            let region = vk::ImageBlit::default()
+            let region = vk::ImageCopy::default()
                 .src_subresource(subresource)
-                .src_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: self.width as i32,
-                        y: self.height as i32,
-                        z: 1,
-                    },
-                ])
                 .dst_subresource(subresource)
-                .dst_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: self.width as i32,
-                        y: self.height as i32,
-                        z: 1,
-                    },
-                ]);
+                .extent(vk::Extent3D {
+                    width: self.width,
+                    height: self.height,
+                    depth: 1,
+                });
 
-            self.context.device.cmd_blit_image(
+            self.context.device.cmd_copy_image(
                 cmd,
                 self.render_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.export_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 std::slice::from_ref(&region),
-                vk::Filter::LINEAR,
             );
 
             image_layout_transition(
@@ -407,7 +400,9 @@ impl DmabufImage {
         }
     }
 
-    /// Blit an external source image (already in TRANSFER_SRC_OPTIMAL) to export.
+    /// Copy an external source image (already in TRANSFER_SRC_OPTIMAL) to export.
+    ///
+    /// Uses `vkCmdCopyImage` for the same reason as `blit_render_to_export_async`.
     pub fn blit_external_to_export_async(&self, source: vk::Image) -> IrisResult<RawFd> {
         unsafe {
             vk_check!(
@@ -453,34 +448,22 @@ impl DmabufImage {
                 .base_array_layer(0)
                 .layer_count(1);
 
-            let region = vk::ImageBlit::default()
+            let region = vk::ImageCopy::default()
                 .src_subresource(subresource)
-                .src_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: self.width as i32,
-                        y: self.height as i32,
-                        z: 1,
-                    },
-                ])
                 .dst_subresource(subresource)
-                .dst_offsets([
-                    vk::Offset3D { x: 0, y: 0, z: 0 },
-                    vk::Offset3D {
-                        x: self.width as i32,
-                        y: self.height as i32,
-                        z: 1,
-                    },
-                ]);
+                .extent(vk::Extent3D {
+                    width: self.width,
+                    height: self.height,
+                    depth: 1,
+                });
 
-            self.context.device.cmd_blit_image(
+            self.context.device.cmd_copy_image(
                 cmd,
                 source,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 self.export_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 std::slice::from_ref(&region),
-                vk::Filter::LINEAR,
             );
 
             image_layout_transition(

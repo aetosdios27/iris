@@ -1,17 +1,18 @@
 use image::ImageDecoder;
 use std::path::Path;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicRange {
     Sdr,
     Hdr,
 }
+
 #[derive(Debug, Clone)]
 pub struct ColorInfo {
-    /// Embedded ICC profile bytes if present.
     pub icc_profile: Option<Vec<u8>>,
-    /// Whether the decoded image should be treated as SDR or HDR.
     pub dynamic_range: DynamicRange,
 }
+
 impl Default for ColorInfo {
     fn default() -> Self {
         Self {
@@ -20,22 +21,20 @@ impl Default for ColorInfo {
         }
     }
 }
-/// Try to extract an embedded ICC profile from a standard image file.
-///
-/// For now we use the `image` crate metadata path where available.
-/// If extraction fails, return None and fall back to sRGB assumptions.
+
 pub fn extract_icc_profile(path: &Path) -> Option<Vec<u8>> {
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
     let format = reader.format()?;
-    // Re-open because `into_decoder()` consumes the reader.
+
     let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
     let mut decoder = reader.into_decoder().ok()?;
+
     match format {
         image::ImageFormat::Png
         | image::ImageFormat::Jpeg
@@ -45,23 +44,25 @@ pub fn extract_icc_profile(path: &Path) -> Option<Vec<u8>> {
         _ => None,
     }
 }
-/// Convert RGBA8 pixels from an embedded ICC profile to sRGB using LittleCMS.
-///
-/// If no ICC is present or conversion fails, returns the original pixels unchanged.
+
 pub fn rgba8_to_srgb_with_icc(rgba: &[u8], width: u32, height: u32, icc: Option<&[u8]>) -> Vec<u8> {
     let Some(icc_bytes) = icc else {
         return rgba.to_vec();
     };
+
     let expected = width as usize * height as usize * 4;
     if rgba.len() != expected {
         return rgba.to_vec();
     }
+
     use lcms2::{Intent, PixelFormat, Profile, Transform};
+
     let src_profile = match Profile::new_icc(icc_bytes) {
         Ok(p) => p,
         Err(_) => return rgba.to_vec(),
     };
     let dst_profile = Profile::new_srgb();
+
     let transform = match Transform::new(
         &src_profile,
         PixelFormat::RGBA_8,
@@ -72,7 +73,43 @@ pub fn rgba8_to_srgb_with_icc(rgba: &[u8], width: u32, height: u32, icc: Option<
         Ok(t) => t,
         Err(_) => return rgba.to_vec(),
     };
+
     let mut out = vec![0u8; rgba.len()];
     transform.transform_pixels(rgba, &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_color_info_is_sdr_without_icc() {
+        let c = ColorInfo::default();
+        assert_eq!(c.dynamic_range, DynamicRange::Sdr);
+        assert!(c.icc_profile.is_none());
+    }
+
+    #[test]
+    fn rgba8_to_srgb_with_icc_returns_original_if_profile_missing() {
+        let rgba = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let out = rgba8_to_srgb_with_icc(&rgba, 2, 1, None);
+        assert_eq!(out, rgba);
+    }
+
+    #[test]
+    fn rgba8_to_srgb_with_icc_returns_original_if_length_mismatch() {
+        let rgba = vec![10u8, 20, 30, 255];
+        let fake_icc = &[1u8, 2, 3, 4];
+        let out = rgba8_to_srgb_with_icc(&rgba, 2, 1, Some(fake_icc));
+        assert_eq!(out, rgba);
+    }
+
+    #[test]
+    fn rgba8_to_srgb_with_icc_returns_original_if_icc_invalid() {
+        let rgba = vec![10u8, 20, 30, 255, 40, 50, 60, 255];
+        let fake_icc = &[1u8, 2, 3, 4];
+        let out = rgba8_to_srgb_with_icc(&rgba, 2, 1, Some(fake_icc));
+        assert_eq!(out, rgba);
+    }
 }
