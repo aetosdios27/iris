@@ -1,132 +1,214 @@
-## About
+# Iris
 
-Iris is a high-performance Wayland image viewer built with Rust, GTK4, and raw Vulkan. It's designed for maximum speed by employing a zero-copy GPU pipeline, aiming to be the fastest image viewer on Linux.
+Iris is a Linux image viewer built in Rust with GTK4/libadwaita and a GPU-native rendering stack.
 
-## Built With
+The current direction is simple:
 
-*   **Rust:** The core programming language for performance and safety.
-*   **GTK4 & libadwaita:** For a modern, native GNOME user interface and efficient graphics offloading.
-*   **Vulkan (ash):** Low-level GPU access for fine-grained control over memory and DMA-BUF export.
-*   **WGSL (naga):** Ergonomic shader language compiled to SPIR-V for cross-platform compatibility.
-*   **DMA-BUF:** Enables zero-copy image display for maximum efficiency.
+- ship a fast, reliable Linux image viewer first
+- use zero-copy GPU presentation where the platform supports it
+- keep the architecture strong enough to grow into a programmable image tool later
 
-## Getting Started
+## Current Status
 
-This section guides you through setting up your development environment and building the `iris` project.
+Iris is an active product prototype moving toward a V1 Linux release.
+
+Today the codebase already has:
+
+- GTK4/libadwaita desktop UI
+- Vulkan-based renderer
+- DMA-BUF presentation path for supported Linux environments
+- software fallback when Vulkan is unavailable
+- directory browsing and thumbnail strip
+- RAW image support
+- ICC-aware color conversion
+- zoom, pan, rotation, metadata panel
+- drag and drop for files and directories
+- directory watching
+- early compute-based image processing toggles
+
+What it is not yet:
+
+- a polished cross-platform app
+- a guaranteed zero-copy path on every Linux setup
+- a finished V1 release
+
+## Product Direction
+
+The product roadmap is:
+
+- V1: stable Linux image viewer
+- V2: cross-platform support and live shader layer
+- V3: GPU-native creative platform
+
+More detail lives in:
+
+- [Product Roadmap](/home/aetos/DevNexus/Code/Projects/iris/docs/PRODUCT_ROADMAP.md)
+- [V1 Release Criteria](/home/aetos/DevNexus/Code/Projects/iris/docs/V1_RELEASE_CRITERIA.md)
+- [V1 Execution Plan](/home/aetos/DevNexus/Code/Projects/iris/docs/V1_EXECUTION_PLAN.md)
+- [Platform Architecture Transition](/home/aetos/DevNexus/Code/Projects/iris/docs/PLATFORM_ARCHITECTURE_TRANSITION.md)
+
+## Rendering Model
+
+Iris is built around a GPU-native rendering approach on Linux.
+
+Preferred path:
+
+- decode image
+- upload to GPU
+- render with Vulkan
+- export a DMA-BUF
+- present through GTK/Wayland
+
+Fallback path:
+
+- if the preferred path is unavailable or rejected by the environment, Iris falls back to a slower but correct presentation path
+
+That distinction matters. The goal is not "Vulkan at any cost." The goal is a reliable app with an elite fast path where available.
+
+## Linux Support Model
+
+Iris should be thought of as a Linux app with tiered rendering support:
+
+- preferred: Wayland + Vulkan + DMA-BUF path active
+- fallback: GPU rendering without zero-copy presentation
+- fallback: software rendering for correctness
+
+See the full support framing here:
+
+- [Support Matrix](/home/aetos/DevNexus/Code/Projects/iris/docs/SUPPORT_MATRIX.md)
+
+## Features In Tree
+
+### Viewer
+
+- open files and directories
+- drag and drop files or folders
+- keyboard navigation
+- zoom in/out
+- drag pan
+- per-image rotation
+- metadata/info panel
+- persisted window state
+
+### Image Handling
+
+- common formats through the `image` crate
+- RAW camera formats through `imagepipe`/`rawloader`
+- ICC-aware conversion to sRGB
+- animated GIF support
+
+### Performance
+
+- Vulkan renderer
+- texture caching
+- directional prefetching
+- persistent thumbnail cache
+- async image decode and metadata work
+
+### Processing
+
+- compute-pass toggles for enhance, sharpen, and denoise
+- WGSL shader pipeline compiled through `naga`
+
+## Tech Stack
+
+- Rust
+- GTK4
+- libadwaita
+- Vulkan via `ash`
+- WGSL shaders via `naga`
+- image decoding via `image`
+- RAW decode via `imagepipe` and `rawloader`
+- color transforms via `lcms2`
+
+## Repo Layout
+
+```text
+iris/
+├── src/
+│   ├── main.rs                  # app shell, UI, navigation, thumbnails
+│   ├── color.rs                 # ICC/profile handling
+│   ├── config.rs                # persisted config
+│   ├── raw.rs                   # RAW detection and decode helpers
+│   ├── thumbcache.rs            # thumbnail cache helpers
+│   └── viewport/
+│       ├── mod.rs               # viewport, decode flow, presentation bridge
+│       ├── camera.rs            # pan/zoom/rotation math
+│       ├── shaders/             # WGSL shaders
+│       └── vk/                  # Vulkan renderer internals
+├── docs/                        # roadmap, release, architecture docs
+├── tests/
+└── ARCHITECTURE.md
+```
+
+## Build
 
 ### Prerequisites
 
-*   **Rust:** Ensure you have Rust and Cargo installed. [Install Rust](https://www.rust-lang.org/tools/install)
-*   **Vulkan SDK:** Required for Vulkan development. [Download Vulkan SDK](https://vulkan.lunarg.com/sdk/home)
-*   **GTK4 & libadwaita:** Development libraries for GTK4 and libadwaita. Installation varies by OS.
+You need:
 
-### Installation
+- Rust and Cargo
+- Vulkan loader and development libraries
+- GTK4 development libraries
+- libadwaita development libraries
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/yourusername/iris.git
-    cd iris
-    ```
-2.  **Build the project:**
-    ```bash
-    cargo build
-    ```
-3.  **Run the application:**
-    ```bash
-    cargo run
-    ```
+Exact package names vary by distro.
 
-## Usage
-
-Launch Iris by providing an image file path as a command-line argument.
+### Build
 
 ```bash
-iris /path/to/your/image.jpg
+cargo build
 ```
 
-### Basic Navigation
+### Run
 
-*   **Pan:** Click and drag the image.
-*   **Zoom:** Scroll your mouse wheel.
-*   **Fit to View:** Press `F`.
-*   **Reset View:** Press `R`.
+```bash
+cargo run -- /path/to/image.jpg
+```
 
-### Features
+You can also pass a directory path.
 
-Iris utilizes a zero-copy GPU pipeline for fast rendering. It supports common image formats and offers smooth, hardware-accelerated navigation.
+## Development Notes
 
-# Contributing
+The repo includes a broader strategic doc set than the current code alone would suggest. That is intentional. The code is still V1-oriented, but the architecture is being evaluated against later platform ambitions.
 
-We welcome contributions! Please follow these guidelines to help us maintain a consistent and high-quality project.
+Useful docs:
 
-## Reporting Bugs
+- [Release Checklist](/home/aetos/DevNexus/Code/Projects/iris/docs/RELEASE_CHECKLIST.md)
+- [Benchmark Plan](/home/aetos/DevNexus/Code/Projects/iris/docs/BENCHMARK_PLAN.md)
+- [Support Matrix](/home/aetos/DevNexus/Code/Projects/iris/docs/SUPPORT_MATRIX.md)
 
-*   Clearly describe the bug and the steps to reproduce it.
-*   Include your operating system and `iris` version.
-*   If possible, provide relevant logs or screenshots.
+## Benchmarks
 
-## Suggesting Features
+Benchmark claims should be treated as pending until they are backed by the benchmark plan and measured against:
 
-*   Open an issue to discuss your idea before submitting a pull request.
-*   Explain the problem the feature solves and how it would be used.
+- eog
+- feh
+- Gwenview
+- Nomacs
 
-## Pull Requests
+The benchmark methodology is tracked here:
 
-*   Ensure your code follows the project's coding style.
-*   Write clear commit messages.
-*   Open a pull request with a descriptive title and summary of changes.
-*   All contributions are subject to review.
+- [Benchmark Plan](/home/aetos/DevNexus/Code/Projects/iris/docs/BENCHMARK_PLAN.md)
 
-## Architecture
+## Known Reality
 
-### Directory Structure
+Iris is promising, but still under active hardening.
 
-*   `src/`: Contains the core application logic.
-    *   `main.rs`: Manages application state and UI setup, handles user input.
-    *   `viewport/`: Handles the image display and rendering.
-        *   `mod.rs`: The main viewport widget, integrating with GTK and triggering renders.
-        *   `camera.rs`: Manages camera properties like position, zoom, and rotation.
-        *   `shaders/`: Contains shader code.
-            *   `image.wgsl`: WGSL shader for image rendering, compiled to SPIR-V.
-        *   `vk/`: Vulkan-specific implementation details.
-            *   `context.rs`: Manages the Vulkan rendering context.
-            *   `shader.rs`: Handles WGSL to SPIR-V compilation.
+Current areas that still matter for V1:
 
-### Component Map
+- DMA-BUF compatibility across real Linux stacks
+- render-path observability
+- descriptor/cache safety
+- release packaging
+- benchmark validation
 
-*   **GTK4 UI:** Provides the window and user interface elements.
-*   **`AppState` (`main.rs`):** Holds the overall application state and orchestrates components.
-*   **`Viewport` (`viewport/mod.rs`):** The core widget responsible for displaying the image. It receives input and signals the need for rendering.
-*   **`Camera` (`viewport/camera.rs`):** Manages image transformations (pan, zoom, rotate).
-*   **Vulkan Backend (`viewport/vk/`):** Handles low-level GPU rendering using Vulkan.
-    *   `VkContext`: Initializes and manages Vulkan resources.
-    *   Shader Compilation: Converts WGSL shaders to SPIR-V for the GPU.
-*   **DMA-BUF:** Used for efficient, zero-copy image data transfer to the GPU.
+## Contributing
 
-### Data Flow
+If you want to contribute, start by reading:
 
-1.  **Image Loading:** An image file is loaded into memory.
-2.  **Input Handling:** User input (keyboard, mouse) is captured by the GTK UI and passed to `AppState`.
-3.  **State Update:** `AppState` updates the `Camera` or other relevant state based on input.
-4.  **Render Trigger:** The `Viewport` widget is notified of state changes and triggers a render.
-5.  **Vulkan Rendering:** The Vulkan backend prepares rendering commands.
-    *   Image data is efficiently transferred to the GPU (e.g., via DMA-BUF).
-    *   Shaders are compiled and applied.
-    *   The image is rendered onto the screen.
+- [V1 Release Criteria](/home/aetos/DevNexus/Code/Projects/iris/docs/V1_RELEASE_CRITERIA.md)
+- [V1 Execution Plan](/home/aetos/DevNexus/Code/Projects/iris/docs/V1_EXECUTION_PLAN.md)
+- [Platform Architecture Transition](/home/aetos/DevNexus/Code/Projects/iris/docs/PLATFORM_ARCHITECTURE_TRANSITION.md)
 
-## Future Vision
-
-Iris is built on a foundation designed for ambitious, zero-latency features. Our long-term goals focus on pushing the boundaries of image viewing performance.
-
-*   **True Zero-Latency Navigation:** Aiming for instant transitions between adjacent images. This involves prefetching and double-buffering to ensure the next image is decoded, uploaded to the GPU, and ready for display the moment you navigate.
-*   **Enhanced GPU Pipeline:** Further optimizing the zero-copy GPU pipeline for maximum efficiency. This means images are uploaded to the GPU only once, processed through a custom Vulkan pipeline, and seamlessly handed off for rendering.
-
-## Known Limitations & Open Issues
-
-*   **Error Handling:** Vulkan calls currently panic on failure. Production builds require graceful error handling and fallback mechanisms (e.g., software rendering if Vulkan is unavailable).
-*   **Image Size Limits:** The Vulkan renderer does not yet clamp image sizes to GPU limits. Uploading extremely large images (e.g., 20,000x20,000 pixels) may cause crashes.
-*   **Cache Budget:** The cache budget for the Vulkan renderer is currently hardcoded and needs to be made configurable or dynamically managed.
-
----
-
-*This README was generated by [DevDoq](https://devdoq.com)*
+Contributions that improve Linux reliability, rendering correctness, cache safety, or release readiness are the highest leverage for V1.
